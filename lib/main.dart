@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,6 +9,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:http/http.dart' as http;
 import 'package:openvpn_flutter/openvpn_flutter.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -26,6 +28,13 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   prefs = await SharedPreferences.getInstance();
   L.init(WidgetsBinding.instance.platformDispatcher.locale);
+  LicenseRegistry.addLicense(() => Stream.value(const LicenseEntryWithLineBreaks(
+        ['OpenVPN', 'ics-openvpn (openvpn_library)'],
+        'GNU General Public License v2.\n'
+        'OpenVPN: https://github.com/OpenVPN/openvpn\n'
+        'ics-openvpn: https://github.com/schwabe/ics-openvpn\n'
+        'openvpn_library: https://github.com/nizwar/openvpn_library',
+      )));
   runApp(const HoporaApp());
   AdsManager.init();
 }
@@ -282,7 +291,8 @@ class VpnGateApi {
     'http://www.vpngate.net/api/iphone/',
   ];
 
-  static Future<List<VpnServer>> fetchServers() async {
+  /// Telecharge la liste brute (CSV) des serveurs VPN Gate.
+  static Future<String> fetchRaw() async {
     Object? lastError;
     for (final url in _urls) {
       try {
@@ -291,8 +301,7 @@ class VpnGateApi {
             .timeout(const Duration(seconds: 25));
         if (res.statusCode == 200) {
           final body = utf8.decode(res.bodyBytes, allowMalformed: true);
-          final list = _parse(body);
-          if (list.isNotEmpty) return list;
+          if (parse(body).isNotEmpty) return body;
           lastError = 'empty';
         } else {
           lastError = 'HTTP ${res.statusCode}';
@@ -304,7 +313,7 @@ class VpnGateApi {
     throw Exception('VPN Gate: $lastError');
   }
 
-  static List<VpnServer> _parse(String body) {
+  static List<VpnServer> parse(String body) {
     final seenIps = <String>{};
     final out = <VpnServer>[];
     for (final raw in const LineSplitter().convert(body)) {
@@ -370,6 +379,27 @@ class VpnGateApi {
       }
     } catch (_) {}
     return null;
+  }
+}
+
+/// Liste des serveurs gardee sur le telephone : demarrage instantane, et
+/// l'appli reste utilisable la ou le site VPN Gate est bloque.
+class ServerCache {
+  static Future<File> _file() async =>
+      File('${(await getApplicationSupportDirectory()).path}/servers.csv');
+
+  static Future<String?> read() async {
+    try {
+      final f = await _file();
+      if (await f.exists()) return await f.readAsString();
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<void> write(String body) async {
+    try {
+      await (await _file()).writeAsString(body, flush: true);
+    } catch (_) {}
   }
 }
 
@@ -454,6 +484,16 @@ class _ServerListPageState extends State<ServerListPage>
   bool _showWarning = true;
   bool _revealIp = false; // mode discret : IP masquee par defaut
 
+  bool _fromCache = false;
+
+  // Historique local : ip -> [connexions reussies, date du dernier echec].
+  // Reste sur le telephone ; sert a ecarter les serveurs qui echouent chez vous.
+  Map<String, List<int>> _history = {};
+
+  // Test de debit du tunnel.
+  double? _speedMbps;
+  bool _speedTesting = false;
+
   // Ping mesure depuis l'appareil : ip -> ms (-1 = injoignable).
   final Map<String, int> _latency = {};
   bool _measuring = false;
@@ -502,7 +542,57 @@ class _ServerListPageState extends State<ServerListPage>
       },
       lastStatus: _onVpnStatus,
     );
+    _loadHistory();
     _load();
+  }
+
+  void _loadHistory() {
+    try {
+      final raw = prefs.getString('history');
+      if (raw == null) return;
+      final m = jsonDecode(raw) as Map<String, dynamic>;
+      _history = m.map((k, v) => MapEntry(
+          k, (v as List).map((e) => (e as num).toInt()).toList()));
+    } catch (_) {}
+  }
+
+  void _record(String ip, bool ok) {
+    final h = _history[ip] ?? [0, 0];
+    if (ok) {
+      h[0] = h[0] + 1;
+      h[1] = 0;
+    } else {
+      h[1] = DateTime.now().millisecondsSinceEpoch;
+    }
+    _history[ip] = h;
+    if (_history.length > 400) {
+      _history.remove(_history.keys.first);
+    }
+    prefs.setString('history', jsonEncode(_history));
+  }
+
+  Future<void> _runSpeedTest() async {
+    setState(() {
+      _speedTesting = true;
+      _speedMbps = null;
+    });
+    try {
+      final sw = Stopwatch()..start();
+      final res = await http
+          .get(Uri.parse('https://speed.cloudflare.com/__down?bytes=3000000'))
+          .timeout(const Duration(seconds: 30));
+      sw.stop();
+      if (res.statusCode != 200 || res.bodyBytes.isEmpty) throw 'speed';
+      final secs = sw.elapsedMicroseconds / 1e6;
+      final mbps = res.bodyBytes.length * 8 / secs / 1e6;
+      if (mounted) setState(() => _speedMbps = mbps);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(L.t('speed_failed'))));
+      }
+    }
+    if (mounted) setState(() => _speedTesting = false);
   }
 
   @override
@@ -592,6 +682,7 @@ class _ServerListPageState extends State<ServerListPage>
           await VpnGateApi.currentIp(timeout: const Duration(seconds: 5));
       if (!mounted || id != _attempt) return;
       if (ip != null && ip.ip != _ipBefore?.ip) {
+        _record(s.ip, true);
         setState(() {
           _verified = true;
           _myIp = ip;
@@ -619,6 +710,7 @@ class _ServerListPageState extends State<ServerListPage>
       return;
     }
     _failedIps.add(s.ip);
+    _record(s.ip, false);
     final next = _fastestExcluding(_failedIps);
     if (next != null && _failovers < 2) {
       _failovers++;
@@ -656,6 +748,7 @@ class _ServerListPageState extends State<ServerListPage>
       _verified = false;
       _cipherInUse = null;
       _connectedAt = null;
+      _speedMbps = null;
       _stage = VPNStage.prepare;
     });
     try {
@@ -818,23 +911,41 @@ class _ServerListPageState extends State<ServerListPage>
       _loading = true;
       _error = null;
     });
+    // 1) Liste enregistree : affichage immediat.
+    if (_all.isEmpty) {
+      final cached = await ServerCache.read();
+      if (cached != null && mounted) {
+        final list = VpnGateApi.parse(cached);
+        if (list.isNotEmpty) {
+          setState(() {
+            _all = list;
+            _fromCache = true;
+          });
+          if (!_isConnected && !_isBusy) _measureFastest();
+        }
+      }
+    }
+    // 2) Liste a jour depuis VPN Gate.
     final ipFuture = VpnGateApi.currentIp();
     try {
-      final servers = await VpnGateApi.fetchServers();
+      final body = await VpnGateApi.fetchRaw();
+      final servers = VpnGateApi.parse(body);
+      unawaited(ServerCache.write(body));
       if (!mounted) return;
       setState(() {
         _all = servers;
-        _latency.clear();
+        _fromCache = false;
+        if (!_isConnected) _latency.clear();
       });
-      if (!_isConnected) _measureFastest();
+      if (!_isConnected && !_isBusy) _measureFastest();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = L.t('error_load'));
+      if (_all.isEmpty) setState(() => _error = L.t('error_load'));
     }
     final ip = await ipFuture;
     if (!mounted) return;
     setState(() {
-      _myIp = ip;
+      if (ip != null) _myIp = ip;
       _ipFailed = ip == null;
       _loading = false;
     });
@@ -862,14 +973,25 @@ class _ServerListPageState extends State<ServerListPage>
     if (mounted && run == _measureRun) setState(() => _measuring = false);
   }
 
-  /// Note de rapidite : debit divise par la latence (mesuree si possible).
+  /// Note de rapidite estimee pour CET utilisateur :
+  /// debit du serveur partage entre ses utilisateurs, divise par la latence
+  /// reelle mesuree depuis le telephone, corrige par l'historique local.
   double _quality(VpnServer s) {
     final l = _latency[s.ip];
     if (l == -1) return -1; // injoignable depuis cet appareil
     final ping = (l != null && l > 0)
         ? l.toDouble()
         : (s.ping > 0 ? s.ping + 150.0 : 400.0); // non mesure : penalise
-    return s.speedMbps / (1 + ping / 40);
+    final share = 1 + s.sessions / 8; // le debit se partage entre utilisateurs
+    var q = s.speedMbps / share / (1 + ping / 40);
+    final h = _history[s.ip];
+    if (h != null) {
+      final failedRecently = h[1] > 0 &&
+          DateTime.now().millisecondsSinceEpoch - h[1] < 24 * 3600 * 1000;
+      if (failedRecently) q *= 0.1;
+      q *= 1 + 0.15 * math.min(h[0], 4);
+    }
+    return q;
   }
 
   List<VpnServer> get _filtered => _all
@@ -974,6 +1096,18 @@ class _ServerListPageState extends State<ServerListPage>
                   onTap: () => launchUrl(Uri.parse(privacyUrl),
                       mode: LaunchMode.externalApplication),
                 ),
+                ListTile(
+                  leading: const Icon(Icons.code),
+                  title: Text(L.t('licenses')),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    showLicensePage(
+                      context: context,
+                      applicationName: 'Hopora VPN',
+                      applicationLegalese: L.t('legalese'),
+                    );
+                  },
+                ),
                 const SizedBox(height: 8),
               ],
             ),
@@ -1034,6 +1168,10 @@ class _ServerListPageState extends State<ServerListPage>
                         onQuickConnect:
                             fastest == null ? null : () => _connectTo(fastest),
                         onDisconnect: _disconnect,
+                        verified: _verified,
+                        speedMbps: _speedMbps,
+                        speedTesting: _speedTesting,
+                        onSpeedTest: _runSpeedTest,
                       ),
                       if (_notice != null)
                         _NoticeCard(
@@ -1074,7 +1212,8 @@ class _ServerListPageState extends State<ServerListPage>
                         child: Text(
                           L.t('servers_count',
                                   {'n': shown.length, 'total': _all.length}) +
-                              (_measuring ? L.t('measuring') : ''),
+                              (_measuring ? L.t('measuring') : '') +
+                              (_fromCache ? ' · ${L.t('from_cache')}' : ''),
                           style: Theme.of(context).textTheme.labelLarge,
                         ),
                       ),
@@ -1123,7 +1262,15 @@ class _VpnCard extends StatelessWidget {
   final DateTime? connectedAt;
   final VoidCallback? onQuickConnect;
   final VoidCallback onDisconnect;
+  final bool verified;
+  final double? speedMbps;
+  final bool speedTesting;
+  final VoidCallback onSpeedTest;
   const _VpnCard({
+    required this.verified,
+    required this.speedMbps,
+    required this.speedTesting,
+    required this.onSpeedTest,
     required this.stage,
     required this.active,
     required this.fastest,
@@ -1222,6 +1369,26 @@ class _VpnCard extends StatelessWidget {
                   ? L.t('disconnect')
                   : L.t('quick_connect')),
             ),
+            if (connected && verified) ...[
+              const SizedBox(height: 6),
+              Center(
+                child: speedTesting
+                    ? Padding(
+                        padding: const EdgeInsets.all(10),
+                        child: Text(L.t('speed_testing'),
+                            style: tt.bodyMedium?.copyWith(color: fg)),
+                      )
+                    : TextButton.icon(
+                        style: TextButton.styleFrom(foregroundColor: fg),
+                        onPressed: onSpeedTest,
+                        icon: const Icon(Icons.speed),
+                        label: Text(speedMbps == null
+                            ? L.t('speed_test')
+                            : L.t('speed_result',
+                                {'v': speedMbps!.toStringAsFixed(1)})),
+                      ),
+              ),
+            ],
             if (!connected && !busy) ...[
               const SizedBox(height: 8),
               Text(L.t('session_note'),

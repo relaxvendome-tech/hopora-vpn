@@ -1,7 +1,7 @@
 name: hopora_vpn
 description: "Hopora VPN - 50 serveurs VPN gratuits (VPN Gate), VPN integre, 20 langues."
 publish_to: 'none'
-version: 2.1.0+11
+version: 2.2.0+12
 
 environment:
   sdk: '>=3.4.0 <4.0.0'

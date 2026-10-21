@@ -33,7 +33,7 @@ jobs:
 
       - name: Bibliotheques
         run: |
-          flutter pub add http google_mobile_ads openvpn_flutter shared_preferences url_launcher
+          flutter pub add http google_mobile_ads openvpn_flutter shared_preferences url_launcher path_provider
           flutter pub add dev:flutter_launcher_icons
           flutter pub get
           grep -A12 "^dependencies:" pubspec.yaml
