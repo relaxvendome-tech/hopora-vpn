@@ -89,13 +89,6 @@ jobs:
           git commit -q -m "APK Hopora VPN ${GITHUB_SHA::7}"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" hopora-apk
 
-      - name: Transmettre l'APK au test sur Android virtuel
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-          retention-days: 3
-
   e2e:
     # Test reel sur un Android virtuel : connexion Tor directe puis Snowflake,
     # confirmee par check.torproject.org. Les captures sont deposees dans la
@@ -106,9 +99,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: apk
+      - name: Recuperer l'APK construit (branche hopora-apk)
+        run: |
+          git clone -q --depth 1 --branch hopora-apk "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" /tmp/apk
+          cat /tmp/apk/HoporaVPN.apk.part* > app-release.apk
+          (cd /tmp/apk && cat HoporaVPN.apk.part* | sha256sum) ; cat /tmp/apk/HoporaVPN.apk.sha256
+          git -C /tmp/apk log -1 --format=%s
 
       - name: Activer la virtualisation (KVM)
         run: |
