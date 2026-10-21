@@ -72,9 +72,17 @@ jobs:
           mkdir -p /tmp/out && cp build/app/outputs/flutter-apk/app-release.apk /tmp/out/HoporaVPN.apk
           cp build/app/outputs/bundle/release/app-release.aab /tmp/out/HoporaVPN-unsigned.aab
           cd /tmp/out
+          ls -la
+          # GitHub refuse les fichiers de plus de 100 Mo : decoupage en morceaux.
+          for f in HoporaVPN.apk HoporaVPN-unsigned.aab; do
+            sha256sum "$f" > "$f.sha256"
+            split -b 90m -d "$f" "$f.part"
+            rm "$f"
+          done
+          ls -la
           git init -q -b hopora-apk
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add HoporaVPN.apk HoporaVPN-unsigned.aab
+          git add .
           git commit -q -m "APK Hopora VPN ${GITHUB_SHA::7}"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" hopora-apk
