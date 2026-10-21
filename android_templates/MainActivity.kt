@@ -113,6 +113,7 @@ class MainActivity : FlutterActivity() {
                     "start" -> {
                         pendingTransport = call.argument<String>("transport") ?: "direct"
                         pendingNotif = call.argument<String>("notif") ?: "Tor"
+                        pendingBridges = call.argument<String>("bridges") ?: ""
                         val prep = VpnService.prepare(this)
                         if (prep != null) {
                             TorVpnService.state = "permission"
@@ -130,6 +131,7 @@ class MainActivity : FlutterActivity() {
                     "transport" -> {
                         torIntent(TorVpnService.ACTION_TRANSPORT)
                             ?.putExtra(TorVpnService.EXTRA_TRANSPORT, call.argument<String>("transport"))
+                            ?.putExtra(TorVpnService.EXTRA_BRIDGES, call.argument<String>("bridges") ?: "")
                             ?.let { startService(it) }
                         result.success(null)
                     }
@@ -164,6 +166,7 @@ class MainActivity : FlutterActivity() {
 
     private var pendingTransport = "direct"
     private var pendingNotif = "Tor"
+    private var pendingBridges = ""
 
     private fun torIntent(action: String): Intent? =
         if (TorVpnService.state == "off" && action != TorVpnService.ACTION_START) null
@@ -174,6 +177,7 @@ class MainActivity : FlutterActivity() {
             .setAction(TorVpnService.ACTION_START)
             .putExtra(TorVpnService.EXTRA_TRANSPORT, pendingTransport)
             .putExtra(TorVpnService.EXTRA_NOTIF, pendingNotif)
+            .putExtra(TorVpnService.EXTRA_BRIDGES, pendingBridges)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
     }
 

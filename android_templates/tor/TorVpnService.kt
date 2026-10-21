@@ -61,17 +61,32 @@ object TorBridges {
         "meek_lite 192.0.2.20:80 url=https://1603026938.rsc.cdn77.org front=www.phpmyadmin.net utls=HelloRandomizedALPN",
     )
 
-    fun ptName(t: String): String? = when (t) {
-        "obfs4" -> "obfs4"
-        "snowflake" -> "snowflake"
-        "meek" -> "meek_lite"
-        else -> null
+    const val AMP_BROKER = "https://snowflake-broker.torproject.net/"
+    const val AMP_CACHE = "https://cdn.ampproject.org/"
+    const val AMP_FRONTS = "www.google.com"
+
+    /** Ponts personnels (colles par l'utilisateur). */
+    @Volatile var custom: List<String> = emptyList()
+
+    private val PTS = setOf("obfs4", "webtunnel", "meek_lite", "snowflake")
+
+    fun ptNames(t: String): Set<String> = when (t) {
+        "obfs4" -> setOf("obfs4")
+        "snowflake", "snowflake_amp" -> setOf("snowflake")
+        "meek" -> setOf("meek_lite")
+        "custom" -> custom.mapNotNull { l -> l.substringBefore(' ').takeIf { it in PTS } }.toSet()
+        else -> emptySet()
     }
 
     fun lines(t: String): List<String> = when (t) {
         "obfs4" -> obfs4
         "snowflake" -> snowflake
+        "snowflake_amp" -> snowflake.mapIndexed { i, l ->
+            val fp = l.split(' ')[2]
+            "snowflake 192.0.2.${5 + i}:80 $fp fingerprint=$fp url=$AMP_BROKER fronts=$AMP_FRONTS ice=$SF_ICE utls-imitate=hellorandomizedalpn"
+        }
         "meek" -> meek
+        "custom" -> custom
         else -> emptyList()
     }
 }
@@ -96,6 +111,7 @@ class TorVpnService : VpnService() {
         const val ACTION_NEWNYM = "hopora.tor.NEWNYM"
         const val EXTRA_TRANSPORT = "transport"
         const val EXTRA_NOTIF = "notif"
+        const val EXTRA_BRIDGES = "bridges"
         private const val CHANNEL = "hopora_tor"
         private const val NOTIF_ID = 4242
 
@@ -126,7 +142,7 @@ class TorVpnService : VpnService() {
     @Volatile private var tor: TorService? = null
     private var bound = false
     @Volatile private var hevRunning = false
-    private var activePt: String? = null
+    private val activePts = mutableSetOf<String>()
     private var notifText = "Tor"
 
     private val conn = object : ServiceConnection {
@@ -141,6 +157,10 @@ class TorVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        intent?.getStringExtra(EXTRA_BRIDGES)?.let { b ->
+            TorBridges.custom = b.lines().map { it.trim().removePrefix("Bridge ").trim() }
+                .filter { it.isNotEmpty() && !it.startsWith("#") }
+        }
         when (intent?.action) {
             ACTION_STOP -> {
                 stopAll()
@@ -224,8 +244,7 @@ class TorVpnService : VpnService() {
         worker.execute {
             try {
                 Pt.dir = File(cacheDir, "pt").absolutePath
-                val port = startPt(t)
-                writeTorrc(torLines(t, port))
+                writeTorrc(torLines(t, startPts(t)))
                 main.post {
                     bound = bindService(Intent(this, TorService::class.java), conn, BIND_AUTO_CREATE)
                     if (!bound) fail("tor")
@@ -251,36 +270,47 @@ class TorVpnService : VpnService() {
         return b.establish()
     }
 
-    private fun startPt(t: String): Long {
-        val name = TorBridges.ptName(t) ?: return 0L
+    private fun startPts(t: String): Map<String, Long> {
+        val names = TorBridges.ptNames(t)
+        if (names.isEmpty()) return emptyMap()
         val c = Pt.controller
-        if (t == "snowflake") {
+        if ("snowflake" in names) {
+            val amp = t == "snowflake_amp"
             c.snowflakeIceServers = TorBridges.SF_ICE
-            c.snowflakeBrokerUrl = TorBridges.SF_URL
-            c.snowflakeFrontDomains = TorBridges.SF_FRONTS
-            c.snowflakeAmpCacheUrl = ""
+            c.snowflakeBrokerUrl = if (amp) TorBridges.AMP_BROKER else TorBridges.SF_URL
+            c.snowflakeFrontDomains = if (amp) TorBridges.AMP_FRONTS else TorBridges.SF_FRONTS
+            c.snowflakeAmpCacheUrl = if (amp) TorBridges.AMP_CACHE else ""
             c.snowflakeSqsUrl = ""
             c.snowflakeSqsCreds = ""
         }
-        c.start(name, null)
-        activePt = name
-        return c.port(name)
+        val ports = mutableMapOf<String, Long>()
+        for (n in names) {
+            c.start(n, null)
+            activePts.add(n)
+            ports[n] = c.port(n)
+        }
+        return ports
     }
 
     private fun stopPt() {
-        val name = activePt ?: return
-        try {
-            Pt.controller.stop(name)
-        } catch (_: Exception) {
+        for (n in activePts) {
+            try {
+                Pt.controller.stop(n)
+            } catch (_: Exception) {
+            }
         }
-        activePt = null
+        activePts.clear()
     }
 
-    private fun torLines(t: String, port: Long): List<String> {
-        val name = TorBridges.ptName(t)
-        if (name == null || port !in 1L..65535L) return listOf("UseBridges 0")
-        return listOf("UseBridges 1", "ClientTransportPlugin $name socks5 127.0.0.1:$port") +
-            TorBridges.lines(t).map { "Bridge $it" }
+    private fun torLines(t: String, ports: Map<String, Long>): List<String> {
+        val bridges = TorBridges.lines(t)
+        if (bridges.isEmpty()) return listOf("UseBridges 0")
+        val out = mutableListOf("UseBridges 1")
+        for ((n, p) in ports) {
+            if (p in 1L..65535L) out.add("ClientTransportPlugin $n socks5 127.0.0.1:$p")
+        }
+        out.addAll(bridges.map { "Bridge $it" })
+        return out
     }
 
     private fun writeTorrc(transportLines: List<String>) {
@@ -298,8 +328,7 @@ class TorVpnService : VpnService() {
         val c = tor?.torControlConnection ?: return
         try {
             stopPt()
-            val port = startPt(t)
-            val lines = torLines(t, port)
+            val lines = torLines(t, startPts(t))
             transport = t
             progress = 0
             summary = ""

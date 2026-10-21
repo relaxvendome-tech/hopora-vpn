@@ -29,6 +29,7 @@ class TorCtl {
           'start', {
         'transport': transport,
         'notif': Ghost.enabled ? L.t('notif_neutral') : L.t('tor_notif'),
+        'bridges': prefs.getString('tor_bridges') ?? '',
       });
     } catch (_) {}
   }
@@ -41,7 +42,8 @@ class TorCtl {
 
   static Future<void> transport(String t) async {
     try {
-      await _ch.invokeMethod('transport', {'transport': t});
+      await _ch.invokeMethod('transport',
+          {'transport': t, 'bridges': prefs.getString('tor_bridges') ?? ''});
     } catch (_) {}
   }
 
@@ -124,15 +126,21 @@ class _HomeShellState extends State<HomeShell> {
 // Ecran Tor
 // ---------------------------------------------------------------------------
 
-const _methods = ['auto', 'direct', 'snowflake', 'obfs4', 'meek'];
-const _chain = ['direct', 'snowflake', 'obfs4', 'meek'];
+const _methods = [
+  'auto', 'direct', 'snowflake', 'snowflake_amp', 'obfs4', 'meek', 'custom'
+];
+const _chain = ['direct', 'snowflake', 'snowflake_amp', 'obfs4', 'meek'];
+
+bool get _hasCustom => (prefs.getString('tor_bridges') ?? '').trim().isNotEmpty;
 
 String _methodLabel(String m) => switch (m) {
       'auto' => L.t('tor_auto'),
       'direct' => L.t('tor_direct'),
       'snowflake' => 'Snowflake',
+      'snowflake_amp' => 'Snowflake AMP',
       'obfs4' => 'obfs4',
       'meek' => 'meek',
+      'custom' => L.t('tor_custom'),
       _ => m,
     };
 
@@ -142,6 +150,8 @@ String _methodDesc(String m) => switch (m) {
       'snowflake' => L.t('tor_snowflake_desc'),
       'obfs4' => L.t('tor_obfs4_desc'),
       'meek' => L.t('tor_meek_desc'),
+      'snowflake_amp' => L.t('tor_amp_desc'),
+      'custom' => _hasCustom ? L.t('tor_custom_desc') : L.t('tor_custom_none'),
       _ => '',
     };
 
@@ -279,7 +289,10 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
     if (_method != 'auto') return [_method];
     final last = prefs.getString('tor_last_ok');
     final plan = <String>[];
-    if (last != null && _chain.contains(last)) plan.add(last);
+    if (_hasCustom) plan.add('custom');
+    if (last != null && _chain.contains(last) && !plan.contains(last)) {
+      plan.add(last);
+    }
     for (final t in _chain) {
       if (!plan.contains(t)) plan.add(t);
     }
@@ -322,6 +335,10 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
   }
 
   Future<void> _selectMethod(String m) async {
+    if (m == 'custom') {
+      final ok = await _editBridges();
+      if (ok != true || !_hasCustom) return;
+    }
     setState(() => _method = m);
     await prefs.setString('tor_method', m);
     if (_on || _busy) {
@@ -332,6 +349,49 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
       _lastSwitch = DateTime.now();
       await TorCtl.transport(_plan.first);
     }
+  }
+
+  Future<bool?> _editBridges() {
+    final c = TextEditingController(text: prefs.getString('tor_bridges') ?? '');
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.alt_route),
+        title: Text(L.t('tor_custom')),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(L.t('tor_custom_hint')),
+              const SizedBox(height: 12),
+              TextField(
+                controller: c,
+                minLines: 4,
+                maxLines: 10,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  hintText: 'webtunnel [2001:db8::1]:443 … url=https://…',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(L.t('cancel'))),
+          FilledButton(
+            onPressed: () async {
+              await prefs.setString('tor_bridges', c.text.trim());
+              if (ctx.mounted) Navigator.pop(ctx, true);
+            },
+            child: Text(L.t('tor_save')),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _newIdentity() async {
