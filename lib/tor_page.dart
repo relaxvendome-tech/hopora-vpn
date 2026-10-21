@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'ghost.dart';
 import 'l10n.dart';
 import 'main.dart';
 
@@ -25,7 +26,10 @@ class TorCtl {
   static Future<void> start(String transport) async {
     try {
       await _ch.invokeMethod(
-          'start', {'transport': transport, 'notif': L.t('tor_notif')});
+          'start', {
+        'transport': transport,
+        'notif': Ghost.enabled ? L.t('notif_neutral') : L.t('tor_notif'),
+      });
     } catch (_) {}
   }
 
@@ -416,6 +420,7 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
               if (mounted) setState(() {});
             }),
           ),
+          const PanicButton(),
         ],
       ),
       body: ListView(

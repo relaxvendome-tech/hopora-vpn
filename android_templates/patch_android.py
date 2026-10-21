@@ -18,7 +18,7 @@ for p in perms:
     if p not in m:
         m = m.replace("<application", f'<uses-permission android:name="{p}"/>\n    <application', 1)
 m = m.replace('android:label="hopora_vpn"',
-              'android:label="Hopora VPN" android:usesCleartextTraffic="true" '
+              'android:label="Hopora" android:usesCleartextTraffic="true" '
               'android:allowBackup="false" android:fullBackupContent="false"', 1)
 service = (
     '    <service android:name=".TorVpnService"\n'
@@ -33,7 +33,33 @@ service = (
     '    </application>'
 )
 m = m.replace("</application>", service, 1)
+
+# Camouflage : l'icone de lancement passe par deux alias (Hopora / Calculatrice).
+m, n = re.subn(r"\s*<intent-filter>\s*<action android:name=\"android.intent.action.MAIN\"\s*/>\s*"
+               r"<category android:name=\"android.intent.category.LAUNCHER\"\s*/>\s*</intent-filter>", "", m, count=1)
+assert n == 1, "intent-filter LAUNCHER introuvable"
+launcher = ('<intent-filter><action android:name="android.intent.action.MAIN"/>'
+            '<category android:name="android.intent.category.LAUNCHER"/></intent-filter>')
+aliases = (
+    f'    <activity-alias android:name=".LauncherDefault" android:targetActivity=".MainActivity"\n'
+    f'            android:enabled="true" android:exported="true" android:label="Hopora"\n'
+    f'            android:icon="@mipmap/ic_launcher">{launcher}</activity-alias>\n'
+    f'        <activity-alias android:name=".LauncherCalc" android:targetActivity=".MainActivity"\n'
+    f'            android:enabled="false" android:exported="true" android:label="@string/calc_name"\n'
+    f'            android:icon="@mipmap/ic_calc">{launcher}</activity-alias>\n'
+    '    </application>'
+)
+m = m.replace("</application>", aliases, 1)
 open(m_path, "w").write(m)
+
+import shutil
+res = "android/app/src/main/res"
+for dens in ["mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"]:
+    os.makedirs(f"{res}/mipmap-{dens}", exist_ok=True)
+    shutil.copy(f"android_templates/calc/ic_calc_{dens}.png", f"{res}/mipmap-{dens}/ic_calc.png")
+for d in os.listdir("android_templates/calc/res"):
+    os.makedirs(f"{res}/{d}", exist_ok=True)
+    shutil.copy(f"android_templates/calc/res/{d}/hopora_strings.xml", f"{res}/{d}/hopora_strings.xml")
 
 # --- build.gradle(.kts) de l'appli ---
 for g in glob.glob("android/app/build.gradle*"):

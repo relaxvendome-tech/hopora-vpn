@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'ghost.dart';
 import 'l10n.dart';
 import 'tor_page.dart';
 
@@ -33,6 +34,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   prefs = await SharedPreferences.getInstance();
   L.init(WidgetsBinding.instance.platformDispatcher.locale);
+  Ghost.init();
   LicenseRegistry.addLicense(() => Stream.value(const LicenseEntryWithLineBreaks(
         ['OpenVPN', 'ics-openvpn (openvpn_library)'],
         'GNU General Public License v2.\n'
@@ -138,8 +140,12 @@ class HoporaApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const seed = Color(0xFF3D5AFE);
-    return MaterialApp(
-      title: 'Hopora VPN',
+    return AnimatedBuilder(
+      animation: Listenable.merge([Ghost.locked, Ghost.revision]),
+      builder: (context, _) => MaterialApp(
+      // Nom affiche dans les applis recentes : neutre en mode camouflage.
+      title: Ghost.enabled ? L.t('calc_name') : 'Hopora',
+      navigatorKey: Ghost.navKey,
       debugShowCheckedModeBanner: false,
       locale: Locale(L.lang),
       supportedLocales: L.supported.map((c) => Locale(c)).toList(),
@@ -157,7 +163,8 @@ class HoporaApp extends StatelessWidget {
             ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark),
         useMaterial3: true,
       ),
-      home: const HomeShell(),
+      home: const Gate(),
+    ),
     );
   }
 }
@@ -553,7 +560,7 @@ class _ServerListPageState extends State<ServerListPage>
       onVpnStageChanged: _onVpnStage,
     );
     _vpn.initialize(
-      localizedDescription: 'Hopora VPN',
+      localizedDescription: 'Hopora',
       lastStage: (stage) {
         if (!mounted) return;
         setState(() => _stage = stage);
@@ -780,7 +787,7 @@ class _ServerListPageState extends State<ServerListPage>
       unawaited(_vpn
           .connect(
             s.buildConfig(strong: strong),
-            '${s.country} · Hopora',
+            'Hopora',
             username: 'vpn',
             password: 'vpn',
             certIsRequired: s.certRequired,
@@ -1095,6 +1102,7 @@ class _ServerListPageState extends State<ServerListPage>
             icon: const Icon(Icons.settings_outlined),
             onPressed: _openSettings,
           ),
+          const PanicButton(),
         ],
       ),
       body: _loading && _all.isEmpty
@@ -1286,6 +1294,17 @@ void openAppSettings(BuildContext context, {VoidCallback? onChanged}) {
                     await _secureChannel.invokeMethod('set', v);
                   } catch (_) {}
                   setSheet(() {});
+                  onChanged?.call();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.calculate_outlined),
+                title: Text(L.t('ghost_title')),
+                subtitle: Text(L.t('ghost_desc')),
+                trailing: Text(Ghost.enabled ? L.t('on') : L.t('off')),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await showGhostSetup(context);
                   onChanged?.call();
                 },
               ),

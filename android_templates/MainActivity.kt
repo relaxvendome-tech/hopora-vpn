@@ -1,6 +1,9 @@
 package PACKAGE_NAME
 
+import android.app.ActivityManager
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -10,6 +13,7 @@ import id.laskarmedia.openvpn_flutter.OpenVPNFlutterPlugin
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -21,8 +25,45 @@ class MainActivity : FlutterActivity() {
         // Mode discret (active par defaut) : appli masquee dans les applis
         // recentes et captures d'ecran bloquees.
         val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-        if (prefs.getBoolean("flutter.discreet", true)) {
+        val disguised = prefs.getBoolean("flutter.disguise", false)
+        if (prefs.getBoolean("flutter.discreet", true) || disguised) {
             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        if (disguised) setTaskLabel(getString(R.string.calc_name))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun setTaskLabel(label: String) {
+        try {
+            setTaskDescription(ActivityManager.TaskDescription(label))
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Bascule l'icone de lancement : Hopora <-> Calculatrice. */
+    private fun setDisguise(on: Boolean) {
+        val pm = packageManager
+        val calc = ComponentName(this, "$packageName.LauncherCalc")
+        val normal = ComponentName(this, "$packageName.LauncherDefault")
+        val en = PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+        val dis = PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+        pm.setComponentEnabledSetting(if (on) calc else normal, en, PackageManager.DONT_KILL_APP)
+        pm.setComponentEnabledSetting(if (on) normal else calc, dis, PackageManager.DONT_KILL_APP)
+        setTaskLabel(if (on) getString(R.string.calc_name) else "Hopora")
+    }
+
+    /** Efface les traces locales : caches, fichiers, donnees Tor, autres preferences. */
+    private fun wipeLocal() {
+        fun clear(dir: File?) {
+            dir?.listFiles()?.forEach { it.deleteRecursively() }
+        }
+        clear(cacheDir)
+        clear(filesDir)
+        clear(noBackupFilesDir)
+        clear(getDir("TorService", MODE_PRIVATE))
+        externalCacheDir?.let { clear(it) }
+        File(applicationInfo.dataDir, "shared_prefs").listFiles()?.forEach {
+            if (it.name != "FlutterSharedPreferences.xml") it.delete()
         }
     }
 
@@ -37,6 +78,21 @@ class MainActivity : FlutterActivity() {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     }
                     result.success(null)
+                } else if (call.method == "disguise") {
+                    try {
+                        setDisguise(call.arguments == true)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                } else if (call.method == "wipe") {
+                    Thread {
+                        try {
+                            wipeLocal()
+                        } catch (_: Exception) {
+                        }
+                        runOnUiThread { result.success(null) }
+                    }.start()
                 } else if (call.method == "vpnSettings") {
                     // Reglage Android « VPN permanent » + « Bloquer sans VPN » (kill switch)
                     try {

@@ -1,40 +1,51 @@
-# Hopora VPN
+# Hopora
 
-Appli Android : 50 serveurs VPN gratuits (50 IP différentes, dans de nombreux pays) issus du projet universitaire VPN Gate. Une publicité s'affiche avant chaque connexion, puis le serveur s'ouvre dans l'appli gratuite « OpenVPN for Android » avec un profil au chiffrement renforcé (AES-256-GCM en priorité).
+Free Android VPN with a **built-in Tor mode**, anti-censorship bridges and a **calculator camouflage**.
+Available in 20 languages. Licensed under the **GNU GPL v3** (see `LICENSE`).
 
-## 1. Obtenir l'APK gratuitement (sans installer Flutter)
+## Modes
 
-1. Sur github.com, créez un dépôt nommé `hopora-vpn` (bouton **New**).
-2. **uploading an existing file** → glissez tout le contenu de ce dossier, y compris `.github`.
-   Si le dossier caché `.github` ne passe pas : **Add file → Create new file**, nom `.github/workflows/build-apk.yml`, collez le contenu du fichier.
-3. **Commit changes**. La construction démarre seule (environ 5 minutes).
-4. Onglet **Actions** → dernière exécution → **Artifacts** → **HoporaVPN-apk** (un .zip contenant `app-release.apk`).
+- **Fast** — one-tap connection to the fastest public server of the
+  [VPN Gate](https://www.vpngate.net/) academic project (OpenVPN, embedded engine).
+  Shows an ad before each connection. Volunteer servers may keep logs:
+  not for sensitive use.
+- **Tor** — the whole phone goes through the Tor network (3 encrypted relays),
+  no ads, no trackers.
+  - DNS resolved through Tor (local mapping, no leak), IPv6 blocked.
+  - Built-in bridges: Snowflake, obfs4, meek, with automatic fallback when Tor is blocked.
+  - Independent check through check.torproject.org, new-identity button.
+  - In Tor mode the app contacts neither VPN Gate nor the ad network.
 
-Sans réglage, l'APK utilise les **publicités de test** de Google (marquées « Test Ad ») : parfait pour vérifier que tout marche.
+## Hopora Ghost (camouflage)
 
-## 2. Gagner de l'argent : brancher vos vraies publicités
+- The launcher icon and name become a **working calculator**; Hopora opens with a secret code followed by `=`.
+- Optional **duress code**: shows a normal result while Hopora silently disconnects and wipes its local data.
+- **Panic button** (long-press): disconnect, wipe, back to the calculator.
+- Automatic re-lock when the app goes to the background; screenshots and recents preview blocked.
 
-1. Créez un compte gratuit sur **admob.google.com** (avec votre compte Google ; un particulier peut s'inscrire).
-2. **Applications → Ajouter une application** → Android → « Hopora VPN ». Notez l'**ID d'application** (`ca-app-pub-…~…`).
-3. Dans l'application, **Blocs d'annonces → Interstitiel**. Notez l'**ID du bloc** (`ca-app-pub-…/…`).
-4. **Confidentialité et messagerie → RGPD** : créez et publiez le message de consentement (obligatoire en Europe ; l'appli l'affiche automatiquement).
-5. Sur GitHub, dans votre dépôt : **Settings → Secrets and variables → Actions → New repository secret** :
-   - `ADMOB_APP_ID` = l'ID d'application
-   - `ADMOB_INTERSTITIAL_ID` = l'ID du bloc interstitiel
-6. **Actions → Construire l'APK Hopora → Run workflow** : le nouvel APK contient vos vraies pubs.
+Limits, stated honestly: Android still shows a key icon while a VPN is on, the app is still listed
+in Settings › Apps, and no app can protect a phone already compromised by spyware.
+Hopora has **not** been independently audited. People at high risk should also use
+audited tools (Tor Browser, Signal) and can get free help from the
+[Access Now Digital Security Helpline](https://www.accessnow.org/help/).
 
-Ne cliquez jamais sur vos propres publicités : AdMob bloque les comptes pour ça.
+## Components
 
-## 3. Installer et utiliser
+| Component | License |
+|---|---|
+| [Tor](https://gitlab.torproject.org/tpo/core/tor) via [tor-android](https://github.com/guardianproject/tor-android) | BSD-3-Clause |
+| [IPtProxy](https://github.com/tladesignz/IPtProxy) (Snowflake, Lyrebird/obfs4, meek) | MIT / BSD |
+| [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) | MIT |
+| [openvpn_flutter](https://github.com/nizwar/openvpn_flutter) / OpenVPN / ics-openvpn | GPL-3.0 / GPL-2.0 |
 
-1. Ouvrez `app-release.apk` sur le téléphone ou la tablette (autorisez « Installer des applis inconnues »).
-2. Installez **OpenVPN for Android** (gratuit, Play Store, éditeur Arne Schwabe).
-3. Dans Hopora : choisissez un serveur → **Se connecter** → pub → validez l'import dans OpenVPN → touchez le profil.
-4. Revenez dans Hopora et vérifiez « Votre IP actuelle ».
+## Build
 
-## À savoir
+The app is a Flutter project; the Android part is generated in CI.
+See `.github/workflows/build-apk.yml`: `flutter create`, dependencies, then
+`android_templates/patch_android.py` (manifest, Tor service, JNI, camouflage), then
+`flutter build apk` / `flutter build appbundle`.
 
-- Le tunnel est chiffré par OpenVPN (TLS + AES). Hopora demande AES-256-GCM en priorité ; si un vieux serveur ne le gère pas, la connexion reste chiffrée avec son algorithme d'origine (souvent AES-128-CBC).
-- Les serveurs sont prêtés par des bénévoles et changent souvent : actualisez la liste si l'un ne répond plus. Le bénévole peut voir le trafic non chiffré (sites http) et VPN Gate garde des journaux : pas pour la banque ni les données sensibles.
-- Les revenus AdMob sont à déclarer aux impôts.
-- Publication Google Play : une appli de type VPN peut exiger un compte développeur d'organisation (entreprise).
+---
+
+**FR —** Hopora : VPN Android gratuit avec mode Tor intégré, ponts anti-censure et camouflage
+en calculatrice. Logiciel libre sous licence GNU GPL v3.
