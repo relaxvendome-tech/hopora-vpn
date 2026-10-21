@@ -22,11 +22,9 @@ m = m.replace('android:label="hopora_vpn"',
               'android:allowBackup="false" android:fullBackupContent="false"', 1)
 service = (
     '    <service android:name="de.blinkt.openvpn.core.OpenVPNService"\n'
-    '            android:exported="true"\n'
-    '            android:permission="android.permission.BIND_VPN_SERVICE"\n'
     '            android:foregroundServiceType="systemExempted"\n'
-    '            tools:node="merge">\n'
-    '        </service>\n'
+    '            tools:replace="android:foregroundServiceType"\n'
+    '            tools:node="merge" />\n'
     f'        <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="{app_id}"/>\n'
     '    </application>'
 )
