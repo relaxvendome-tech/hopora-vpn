@@ -6,7 +6,9 @@ APK="$1"; OUT="$2"; mkdir -p "$OUT"
 PKG=com.hopora.hopora_vpn
 UI="python3 ci/ui.py"
 RES="$OUT/resultats.txt"; : > "$RES"
-shot() { adb exec-out screencap -p > "$OUT/$1.png"; }
+# Captures d'ecran noires a cause du mode discret (FLAG_SECURE) : on enregistre
+# aussi le contenu de l'ecran lu par l'accessibilite.
+shot() { adb exec-out screencap -p > "$OUT/$1.png"; $UI dump > "$OUT/$1.txt" 2>&1; }
 step() { echo "== $1"; }
 
 adb wait-for-device
@@ -21,9 +23,9 @@ sleep 12
 shot 01-demarrage
 
 tor_test() {   # $1 = methode affichee, $2 = nom du fichier
-  $UI tap "$1" || return 1
+  $UI tap "$1" || { shot "$2-methode-introuvable"; return 1; }
   sleep 1
-  $UI tap "Connect via Tor" || return 1
+  $UI tap "Connect via Tor" || { shot "$2-bouton-introuvable"; return 1; }
   $UI tap "I agree, connect" >/dev/null 2>&1 || true
   if $UI wait "Confirmed by torproject.org" 420; then
     shot "$2-ok"; return 0
@@ -42,6 +44,7 @@ step "Tor Snowflake"
 if tor_test "Looks like a video call" 04-tor-snowflake; then echo "TOR_SNOWFLAKE=OK" >> "$RES"; else echo "TOR_SNOWFLAKE=ECHEC" >> "$RES"; fi
 $UI tap "Disconnect"; sleep 6
 
-adb logcat -d | grep -iE "hopora|TorService|FATAL|AndroidRuntime" | tail -300 > "$OUT/logcat.txt"
+adb logcat -d | grep -vE "uiautomator|RuntimeInit|default boot image|lock profiling|Shutting down VM" \
+  | grep -iE "hopora|tor|flutter|FATAL|AndroidRuntime|vpn|IPtProxy|hev" | tail -400 > "$OUT/logcat.txt"
 echo "--- termine" >> "$RES"
 cat "$RES"

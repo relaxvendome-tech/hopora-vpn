@@ -120,7 +120,7 @@ jobs:
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 31
-          target: aosp_atd
+          target: google_atd
           channel: canary
           arch: x86_64
           profile: pixel_6
