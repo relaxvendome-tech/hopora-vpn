@@ -46,7 +46,15 @@ jobs:
       - name: Construire
         run: |
           UNIT="${ADMOB_INTERSTITIAL_ID:-ca-app-pub-3940256099942544/1033173712}"
-          flutter build apk --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT"
+          set -o pipefail
+          flutter build apk --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee build.log
+
+      - name: Remonter les erreurs
+        if: failure()
+        run: |
+          { grep -nE "rror|What went wrong|FAILURE|xception|\.dart:[0-9]+|Could not|requires|incompatible" build.log | head -60; echo "----- FIN DU JOURNAL -----"; tail -50 build.log; } > err.txt || true
+          MSG=$(sed 's/%/%25/g; s/\r//g' err.txt | awk '{printf "%s%%0A", $0}')
+          echo "::error title=Build::${MSG}"
 
       - uses: actions/upload-artifact@v4
         with:
