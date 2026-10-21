@@ -31,48 +31,18 @@ jobs:
       - name: Generer le dossier Android
         run: flutter create --platforms=android --org com.hopora --project-name hopora_vpn .
 
-      - name: Configurer Android (Internet, nom, AdMob, minSdk)
+      - name: Bibliotheques
         run: |
-          APP_ID="${ADMOB_APP_ID:-ca-app-pub-3940256099942544~3347511713}"
-          M=android/app/src/main/AndroidManifest.xml
-          grep -q 'android.permission.INTERNET' "$M" || \
-            sed -i '0,/<application/s##<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' "$M"
-          sed -i 's#android:label="hopora_vpn"#android:label="Hopora VPN" android:usesCleartextTraffic="true"#' "$M"
-          sed -i "s#</application>#    <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"$APP_ID\"/>\n    </application>#" "$M"
-          for G in android/app/build.gradle android/app/build.gradle.kts; do
-            [ -f "$G" ] && sed -i -E 's/minSdk(Version)? *=? *flutter\.minSdkVersion/minSdk = 24/' "$G"
-          done
-          # Discretion : pas de sauvegarde cloud des donnees de l'appli
-          sed -i 's#android:label="Hopora VPN"#android:label="Hopora VPN" android:allowBackup="false" android:fullBackupContent="false"#' "$M"
-          # Discretion : ecran masque dans les applis recentes et captures bloquees
-          MA=$(find android/app/src/main -name 'MainActivity.kt' | head -1)
-          PKG=$(grep -m1 '^package ' "$MA")
-          cat > "$MA" <<KOT
-          $PKG
-
-          import android.os.Bundle
-          import android.view.WindowManager
-          import io.flutter.embedding.android.FlutterActivity
-
-          class MainActivity : FlutterActivity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  window.setFlags(
-                      WindowManager.LayoutParams.FLAG_SECURE,
-                      WindowManager.LayoutParams.FLAG_SECURE
-                  )
-              }
-          }
-          KOT
-          cat "$MA"
-          cat "$M"
-          grep -n minSdk android/app/build.gradle* || true
-
-      - name: Bibliotheques a jour
-        run: |
-          flutter pub add google_mobile_ads
+          flutter pub add http google_mobile_ads openvpn_flutter shared_preferences url_launcher
+          flutter pub add dev:flutter_launcher_icons
           flutter pub get
-          grep google_mobile_ads pubspec.yaml
+          grep -A12 "^dependencies:" pubspec.yaml
+
+      - name: Configurer Android (VPN, discretion, AdMob, icone)
+        run: |
+          python3 android_templates/patch_android.py
+          dart run flutter_launcher_icons
+          grep -n minSdk android/app/build.gradle* || true
 
       - name: Construire
         run: |
@@ -84,14 +54,10 @@ jobs:
       - name: Remonter les erreurs
         if: failure()
         run: |
+          touch build.log
           { grep -nE "rror|What went wrong|FAILURE|xception|\.dart:[0-9]+|Could not|requires|incompatible" build.log | head -60; echo "----- FIN DU JOURNAL -----"; tail -50 build.log; } > err.txt || true
           MSG=$(sed 's/%/%25/g; s/\r//g' err.txt | awk '{printf "%s%%0A", $0}')
           echo "::error title=Build::${MSG}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: HoporaVPN-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
 
       - name: Deposer l'APK dans la branche hopora-apk
         run: |

@@ -1,15 +1,31 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:http/http.dart' as http;
-import 'package:open_filex/open_filex.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:openvpn_flutter/openvpn_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-void main() {
+import 'l10n.dart';
+
+const privacyUrl =
+    'https://docs.google.com/document/d/1tQjFS1UTiuDBasafS3ISdxoqun_xpiiz7NTTHG_L2Dc/view';
+
+/// Duree maximale d'une session VPN gratuite (4 h).
+const maxSessionSeconds = 4 * 3600;
+
+late SharedPreferences prefs;
+const _secureChannel = MethodChannel('hopora/secure');
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  prefs = await SharedPreferences.getInstance();
+  L.init(WidgetsBinding.instance.platformDispatcher.locale);
   runApp(const HoporaApp());
   AdsManager.init();
 }
@@ -97,6 +113,13 @@ class HoporaApp extends StatelessWidget {
     return MaterialApp(
       title: 'Hopora VPN',
       debugShowCheckedModeBanner: false,
+      locale: Locale(L.lang),
+      supportedLocales: L.supported.map((c) => Locale(c)).toList(),
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: seed),
         useMaterial3: true,
@@ -144,6 +167,11 @@ class VpnServer {
 
   double get speedMbps => speed / 1000000;
 
+  String get flag => flagOf(countryCode);
+
+  late final String rawConfig =
+      utf8.decode(base64.decode(configB64), allowMalformed: true);
+
   /// Adresse, port et protocole du serveur OpenVPN (ligne "remote").
   late final (String, int, bool)? remote = () {
     try {
@@ -161,18 +189,8 @@ class VpnServer {
     }
   }();
 
-  String get flag {
-    final cc = countryCode.toUpperCase();
-    if (cc.length != 2 ||
-        cc.codeUnits.any((c) => c < 65 || c > 90)) {
-      return '🌐';
-    }
-    return String.fromCharCodes(
-        cc.codeUnits.map((c) => 0x1F1E6 + c - 65).toList());
-  }
-
-  late final String rawConfig =
-      utf8.decode(base64.decode(configB64), allowMalformed: true);
+  /// Le profil contient-il un certificat client ?
+  bool get certRequired => rawConfig.contains('<cert>');
 
   /// Mesure le temps de connexion TCP depuis l'appareil (ms).
   /// null = non mesurable (UDP), -1 = injoignable.
@@ -198,8 +216,8 @@ class VpnServer {
     return m?.group(1) ?? 'AES';
   }
 
-  /// Profil renforce : demande en priorite AES-256-GCM / ChaCha20,
-  /// avec repli sur le chiffrement d'origine pour rester compatible.
+  /// Profil renforce : AES-256-GCM / ChaCha20 en priorite (repli sur le
+  /// chiffrement d'origine) et session limitee a 4 h.
   String get hardenedConfig {
     final fallback = serverCipher.toUpperCase();
     final ciphers = <String>[
@@ -210,23 +228,29 @@ class VpnServer {
           .contains(fallback))
         fallback,
     ];
-    final lines = rawConfig
-        .split(RegExp(r'\r?\n'))
-        .where((l) => !l.trimLeft().startsWith('data-ciphers'))
-        .toList();
+    final lines = rawConfig.split(RegExp(r'\r?\n')).where((l) {
+      final t = l.trimLeft();
+      return !t.startsWith('data-ciphers') &&
+          !t.startsWith('session-timeout') &&
+          !t.startsWith('inactive') &&
+          !t.startsWith('ignore-unknown-option');
+    });
     return [
+      // Options recentes ignorees si le moteur OpenVPN ne les connait pas.
+      'ignore-unknown-option data-ciphers session-timeout',
       'data-ciphers ${ciphers.join(':')}',
-      // Duree maximale de connexion : 4 h, puis deconnexion automatique.
-      // (ignore-unknown-option evite une erreur sur un client trop ancien)
-      'ignore-unknown-option session-timeout',
       'session-timeout $maxSessionSeconds',
-      ...lines.where((l) => !l.trimLeft().startsWith('session-timeout')),
+      // Secours pour les moteurs sans session-timeout : coupe apres 4 h
+      // (seuil de trafic volontairement inatteignable, 1 To).
+      'inactive $maxSessionSeconds 1000000000000',
+      ...lines,
+      '',
     ].join('\n');
   }
 
   String get uptimeLabel {
     final days = uptimeMs ~/ 86400000;
-    if (days >= 1) return '$days j';
+    if (days >= 1) return '$days d';
     final hours = uptimeMs ~/ 3600000;
     return '$hours h';
   }
@@ -249,7 +273,7 @@ class VpnGateApi {
           final body = utf8.decode(res.bodyBytes, allowMalformed: true);
           final list = _parse(body);
           if (list.isNotEmpty) return list;
-          lastError = 'Liste vide';
+          lastError = 'empty';
         } else {
           lastError = 'HTTP ${res.statusCode}';
         }
@@ -257,7 +281,7 @@ class VpnGateApi {
         lastError = e;
       }
     }
-    throw Exception('Impossible de joindre VPN Gate ($lastError)');
+    throw Exception('VPN Gate: $lastError');
   }
 
   static List<VpnServer> _parse(String body) {
@@ -296,11 +320,12 @@ class VpnGateApi {
     final nonce = DateTime.now().millisecondsSinceEpoch;
     try {
       final res = await http
-          .get(Uri.parse('https://ipwho.is/?lang=fr&_=$nonce'),
+          .get(Uri.parse('https://ipwho.is/?lang=${L.lang}&_=$nonce'),
               headers: {'Cache-Control': 'no-cache'})
           .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+        final j =
+            jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
         if (j['success'] != false && j['ip'] != null) {
           final conn = j['connection'];
           return IpInfo(
@@ -353,12 +378,36 @@ String flagOf(String cc) {
   return String.fromCharCodes(c.codeUnits.map((u) => 0x1F1E6 + u - 65).toList());
 }
 
+String fmtDuration(Duration d) {
+  if (d.isNegative) d = Duration.zero;
+  final h = d.inHours;
+  final m = d.inMinutes % 60;
+  return h > 0 ? '$h h ${m.toString().padLeft(2, '0')} min' : '$m min';
+}
+
+String latencyLabel(VpnServer s, int? latency) {
+  if (latency == -1) return L.t('unreachable');
+  if (latency != null && latency > 0) return '$latency ms';
+  return s.ping > 0 ? '~${s.ping} ms' : '?';
+}
+
+const _busyStages = {
+  VPNStage.prepare,
+  VPNStage.authenticating,
+  VPNStage.connecting,
+  VPNStage.authentication,
+  VPNStage.wait_connection,
+  VPNStage.vpn_generate_config,
+  VPNStage.get_config,
+  VPNStage.tcp_connect,
+  VPNStage.udp_connect,
+  VPNStage.assign_ip,
+  VPNStage.resolve,
+};
+
 // ---------------------------------------------------------------------------
 // Ecran principal
 // ---------------------------------------------------------------------------
-
-/// Duree maximale d'une session VPN gratuite (4 h).
-const maxSessionSeconds = 4 * 3600;
 
 enum SortMode { best, score, speed, ping }
 
@@ -389,60 +438,199 @@ class _ServerListPageState extends State<ServerListPage>
   bool _measuring = false;
   int _measureRun = 0;
 
-  // Pour la verification : IP avant connexion + serveur choisi.
+  // Verification : IP avant connexion + serveur choisi.
   IpInfo? _ipBefore;
   VpnServer? _target;
+
+  // Moteur VPN integre.
+  late final OpenVPN _vpn;
+  VPNStage _stage = VPNStage.disconnected;
+  VpnServer? _active;
+  DateTime? _connectedAt;
+  Timer? _sessionTimer;
+  Timer? _tick;
+  String? _notice;
+
+  bool get _isConnected => _stage == VPNStage.connected;
+  bool get _isBusy => _busyStages.contains(_stage);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _cleanProfiles(Duration.zero);
+    _vpn = OpenVPN(
+      onVpnStatusChanged: _onVpnStatus,
+      onVpnStageChanged: _onVpnStage,
+    );
+    _vpn.initialize(
+      localizedDescription: 'Hopora VPN',
+      lastStage: (stage) {
+        if (!mounted) return;
+        setState(() => _stage = stage);
+        if (stage == VPNStage.connected) _armSession();
+      },
+      lastStatus: _onVpnStatus,
+    );
     _load();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _sessionTimer?.cancel();
+    _tick?.cancel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      // Discretion : on efface les profils deja transmis a OpenVPN.
-      _cleanProfiles(const Duration(minutes: 1));
-      // Au retour d'OpenVPN, on reverifie l'IP automatiquement.
-      if (_target != null) {
-        Future.delayed(const Duration(seconds: 2), () {
-          if (mounted) _refreshIp();
-        });
+      if (_isConnected) _armSession(); // coupe si les 4 h sont depassees
+      _refreshIp();
+    }
+  }
+
+  // ----- Moteur VPN -----
+
+  void _onVpnStatus(VpnStatus? s) {
+    final on = s?.connectedOn;
+    if (on != null && mounted && _connectedAt != on) {
+      setState(() => _connectedAt = on);
+      _armSession();
+    }
+  }
+
+  void _onVpnStage(VPNStage stage, String raw) {
+    if (!mounted) return;
+    final was = _stage;
+    setState(() {
+      _stage = stage;
+      if (stage == VPNStage.denied) _notice = L.t('vpn_denied');
+      if (stage == VPNStage.error) _notice = L.t('vpn_error');
+    });
+    if (stage == VPNStage.connected) {
+      _connectedAt ??= DateTime.now();
+      _armSession();
+      Future.delayed(const Duration(seconds: 2), _refreshIp);
+    } else if (stage == VPNStage.disconnected) {
+      _sessionTimer?.cancel();
+      _tick?.cancel();
+      _tick = null;
+      _connectedAt = null;
+      if (was == VPNStage.connected) {
+        Future.delayed(const Duration(seconds: 2), _refreshIp);
       }
     }
   }
 
-  /// Supprime les fichiers de profil temporaires (aucune trace sur l'appareil).
-  Future<void> _cleanProfiles(Duration olderThan) async {
-    try {
-      final dir = await getTemporaryDirectory();
-      final now = DateTime.now();
-      await for (final f in dir.list()) {
-        if (f is File && f.path.endsWith('.ovpn')) {
-          final age = now.difference(await f.lastModified());
-          if (age >= olderThan) await f.delete();
-        }
-      }
-    } catch (_) {}
-  }
-
-  Future<void> _beforeConnect(VpnServer s) async {
-    final current = await VpnGateApi.currentIp() ?? _myIp;
-    if (!mounted) return;
-    setState(() {
-      _ipBefore = current;
-      _target = s;
+  /// Programme la coupure automatique a 4 h et le rafraichissement du compteur.
+  void _armSession() {
+    _sessionTimer?.cancel();
+    final start = _connectedAt ?? DateTime.now();
+    final left = const Duration(seconds: maxSessionSeconds) -
+        DateTime.now().difference(start);
+    if (left <= Duration.zero) {
+      _endSession();
+      return;
+    }
+    _sessionTimer = Timer(left, _endSession);
+    _tick ??= Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
     });
   }
+
+  void _endSession() {
+    _vpn.disconnect();
+    if (mounted) setState(() => _notice = L.t('session_over'));
+  }
+
+  Future<void> _connectTo(VpnServer s) async {
+    // Ecran d'information et de consentement (exige par Google Play).
+    if (!(prefs.getBool('vpn_consent') ?? false)) {
+      final ok = await _showConsent();
+      if (ok != true) return;
+      await prefs.setBool('vpn_consent', true);
+    }
+    // IP de reference prise avant de se connecter.
+    final before = _isConnected ? _ipBefore : await VpnGateApi.currentIp() ?? _myIp;
+    if (!mounted) return;
+    setState(() {
+      _ipBefore = before;
+      _target = s;
+      _notice = null;
+    });
+    await AdsManager.showThen(() async {
+      if (_isConnected || _isBusy) {
+        _vpn.disconnect();
+        await Future.delayed(const Duration(milliseconds: 800));
+      }
+      if (!mounted) return;
+      setState(() {
+        _active = s;
+        _connectedAt = null;
+        _stage = VPNStage.prepare;
+      });
+      try {
+        // Pas d'await : si Android demande l'autorisation VPN, l'appel
+        // ne renvoie jamais de reponse ; la connexion reprend apres accord.
+        unawaited(_vpn
+            .connect(
+              s.hardenedConfig,
+              '${s.country} · Hopora',
+              username: 'vpn',
+              password: 'vpn',
+              certIsRequired: s.certRequired,
+            )
+            .catchError((_) {
+          if (mounted) setState(() => _notice = L.t('vpn_error'));
+        }));
+      } catch (_) {
+        if (mounted) setState(() => _notice = L.t('vpn_error'));
+      }
+    });
+  }
+
+  void _disconnect() {
+    _vpn.disconnect();
+    _sessionTimer?.cancel();
+  }
+
+  Future<bool?> _showConsent() {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.vpn_lock),
+        title: Text(L.t('consent_title')),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(L.t('consent_body')),
+              const SizedBox(height: 8),
+              TextButton.icon(
+                onPressed: () => launchUrl(Uri.parse(privacyUrl),
+                    mode: LaunchMode.externalApplication),
+                icon: const Icon(Icons.policy_outlined),
+                label: Text(L.t('privacy')),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(L.t('cancel'))),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(L.t('consent_accept'))),
+        ],
+      ),
+    );
+  }
+
+  // ----- Donnees -----
 
   Future<void> _load() async {
     setState(() {
@@ -457,10 +645,10 @@ class _ServerListPageState extends State<ServerListPage>
         _all = servers;
         _latency.clear();
       });
-      _measureFastest();
+      if (!_isConnected) _measureFastest();
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+      setState(() => _error = L.t('error_load'));
     }
     final ip = await ipFuture;
     if (!mounted) return;
@@ -521,7 +709,7 @@ class _ServerListPageState extends State<ServerListPage>
   }
 
   Future<void> _refreshIp() async {
-    if (_ipChecking) return;
+    if (_ipChecking || !mounted) return;
     setState(() => _ipChecking = true);
     final ip = await VpnGateApi.currentIp();
     if (!mounted) return;
@@ -563,60 +751,43 @@ class _ServerListPageState extends State<ServerListPage>
     return entries;
   }
 
-  // -------------------------------------------------------------------------
-  // Connexion : pub -> profil renforce -> OpenVPN for Android
-  // -------------------------------------------------------------------------
+  // ----- Interface -----
 
-  Future<void> _connectTo(VpnServer s) async {
-    await _beforeConnect(s);
-    await AdsManager.showThen(() => _openProfile(s));
-  }
-
-  Future<void> _openProfile(VpnServer s) async {
-    try {
-      final dir = await getTemporaryDirectory();
-      // Nom neutre : rien ne revele l'appli ni le serveur.
-      final id = s.ip.hashCode.abs().toRadixString(36);
-      final file = File('${dir.path}/VPN_${s.countryCode}_$id.ovpn');
-      await file.writeAsString(s.hardenedConfig, flush: true);
-      final result = await OpenFilex.open(
-        file.path,
-        type: 'application/x-openvpn-profile',
-      );
-      if (!mounted) return;
-      if (result.type == ResultType.noAppToOpen) {
-        _showMissingOpenVpn();
-      } else if (result.type != ResultType.done) {
-        _snack('Impossible d\'ouvrir le profil : ${result.message}');
-      }
-    } catch (e) {
-      if (mounted) _snack('Impossible d\'ouvrir le profil : $e');
-    }
-  }
-
-  void _snack(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  void _showMissingOpenVpn() {
-    showDialog(
+  void _openSettings() {
+    showModalBottomSheet(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Une dernière étape'),
-        content: const Text(
-            'L\'appli gratuite « OpenVPN for Android » établit la connexion chiffrée. '
-            'Installez-la, puis touchez à nouveau « Connexion rapide ».'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Plus tard')),
-          FilledButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              installOpenVpn();
-            },
-            child: const Text('Installer OpenVPN'),
-          ),
-        ],
+      showDragHandle: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) {
+          final discreet = prefs.getBool('discreet') ?? true;
+          return SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SwitchListTile(
+                  secondary: const Icon(Icons.visibility_off_outlined),
+                  title: Text(L.t('discreet_mode')),
+                  subtitle: Text(L.t('discreet_desc')),
+                  value: discreet,
+                  onChanged: (v) async {
+                    await prefs.setBool('discreet', v);
+                    try {
+                      await _secureChannel.invokeMethod('set', v);
+                    } catch (_) {}
+                    setSheet(() {});
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.policy_outlined),
+                  title: Text(L.t('privacy')),
+                  onTap: () => launchUrl(Uri.parse(privacyUrl),
+                      mode: LaunchMode.externalApplication),
+                ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -630,21 +801,26 @@ class _ServerListPageState extends State<ServerListPage>
         title: const Text('Hopora VPN'),
         actions: [
           PopupMenuButton<SortMode>(
-            tooltip: 'Trier',
+            tooltip: L.t('sort'),
             icon: const Icon(Icons.sort),
             initialValue: _sort,
             onSelected: (m) => setState(() => _sort = m),
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: SortMode.best, child: Text('Les plus rapides pour vous')),
-              PopupMenuItem(value: SortMode.speed, child: Text('Plus gros débit')),
-              PopupMenuItem(value: SortMode.ping, child: Text('Ping le plus bas')),
-              PopupMenuItem(value: SortMode.score, child: Text('Score VPN Gate')),
+            itemBuilder: (_) => [
+              PopupMenuItem(value: SortMode.best, child: Text(L.t('sort_best'))),
+              PopupMenuItem(value: SortMode.speed, child: Text(L.t('sort_speed'))),
+              PopupMenuItem(value: SortMode.ping, child: Text(L.t('sort_ping'))),
+              PopupMenuItem(value: SortMode.score, child: Text(L.t('sort_score'))),
             ],
           ),
           IconButton(
-            tooltip: 'Actualiser',
+            tooltip: L.t('refresh'),
             icon: const Icon(Icons.refresh),
             onPressed: _loading ? null : _load,
+          ),
+          IconButton(
+            tooltip: L.t('settings'),
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: _openSettings,
           ),
         ],
       ),
@@ -657,12 +833,22 @@ class _ServerListPageState extends State<ServerListPage>
                   child: ListView(
                     padding: const EdgeInsets.only(bottom: 24),
                     children: [
-                      _QuickConnectCard(
-                        server: fastest,
+                      _VpnCard(
+                        stage: _stage,
+                        active: _active,
+                        fastest: fastest,
                         latency: fastest == null ? null : _latency[fastest.ip],
                         measuring: _measuring,
-                        onConnect: fastest == null ? null : () => _connectTo(fastest),
+                        connectedAt: _connectedAt,
+                        onQuickConnect:
+                            fastest == null ? null : () => _connectTo(fastest),
+                        onDisconnect: _disconnect,
                       ),
+                      if (_notice != null)
+                        _NoticeCard(
+                          text: _notice!,
+                          onClose: () => setState(() => _notice = null),
+                        ),
                       _IpCard(
                         ip: _myIp,
                         before: _ipBefore,
@@ -670,12 +856,16 @@ class _ServerListPageState extends State<ServerListPage>
                         checking: _ipChecking || (_loading && _myIp == null),
                         failed: _ipFailed,
                         masked: !_revealIp,
-                        onToggleMask: () => setState(() => _revealIp = !_revealIp),
+                        onToggleMask: () =>
+                            setState(() => _revealIp = !_revealIp),
                         onRefresh: _refreshIp,
                       ),
                       if (_showWarning)
-                        _WarningCard(
-                            onClose: () => setState(() => _showWarning = false)),
+                        _NoticeCard(
+                          text: L.t('warning'),
+                          info: true,
+                          onClose: () => setState(() => _showWarning = false),
+                        ),
                       _CountryChips(
                         countries: _countries,
                         selected: _country,
@@ -684,8 +874,9 @@ class _ServerListPageState extends State<ServerListPage>
                       Padding(
                         padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
                         child: Text(
-                          '${shown.length} serveurs (IP différentes) · ${_all.length} disponibles'
-                          '${_measuring ? ' · mesure du ping…' : ''}',
+                          L.t('servers_count',
+                                  {'n': shown.length, 'total': _all.length}) +
+                              (_measuring ? L.t('measuring') : ''),
                           style: Theme.of(context).textTheme.labelLarge,
                         ),
                       ),
@@ -694,6 +885,7 @@ class _ServerListPageState extends State<ServerListPage>
                           server: s,
                           latency: _latency[s.ip],
                           isFastest: identical(s, fastest),
+                          isActive: _isConnected && identical(s, _active),
                           onTap: () => _openSheet(s),
                         ),
                     ],
@@ -710,6 +902,7 @@ class _ServerListPageState extends State<ServerListPage>
       builder: (ctx) => _ConnectSheet(
         server: s,
         latency: _latency[s.ip],
+        switching: _isConnected || _isBusy,
         onConnect: () {
           Navigator.pop(ctx);
           _connectTo(s);
@@ -719,21 +912,173 @@ class _ServerListPageState extends State<ServerListPage>
   }
 }
 
-Future<void> installOpenVpn() async {
-  final market = Uri.parse('market://details?id=de.blinkt.openvpn');
-  final web = Uri.parse(
-      'https://play.google.com/store/apps/details?id=de.blinkt.openvpn');
-  try {
-    final ok = await launchUrl(market, mode: LaunchMode.externalApplication);
-    if (!ok) await launchUrl(web, mode: LaunchMode.externalApplication);
-  } catch (_) {
-    await launchUrl(web, mode: LaunchMode.externalApplication);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
+
+class _VpnCard extends StatelessWidget {
+  final VPNStage stage;
+  final VpnServer? active;
+  final VpnServer? fastest;
+  final int? latency;
+  final bool measuring;
+  final DateTime? connectedAt;
+  final VoidCallback? onQuickConnect;
+  final VoidCallback onDisconnect;
+  const _VpnCard({
+    required this.stage,
+    required this.active,
+    required this.fastest,
+    required this.latency,
+    required this.measuring,
+    required this.connectedAt,
+    required this.onQuickConnect,
+    required this.onDisconnect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    final connected = stage == VPNStage.connected;
+    final busy = _busyStages.contains(stage);
+    const ok = Color(0xFF1E8E3E);
+
+    final bg = connected ? ok : cs.primary;
+    const fg = Colors.white;
+    final s = (connected || busy) ? active : fastest;
+
+    String label;
+    String? sub;
+    if (connected) {
+      label = L.t('protected_via', {'country': active?.country ?? ''});
+      final since = connectedAt == null
+          ? Duration.zero
+          : DateTime.now().difference(connectedAt!);
+      sub = '${L.t('connected_for', {'time': fmtDuration(since)})}\n'
+          '${L.t('session_left', {'time': fmtDuration(const Duration(seconds: maxSessionSeconds) - since)})}';
+    } else if (busy) {
+      label = L.t('connecting');
+      sub = s?.country;
+    } else {
+      label = s?.country ?? L.t('searching');
+      sub = s == null
+          ? null
+          : '${s.speedMbps.toStringAsFixed(0)} Mb/s · ping ${latencyLabel(s, latency)}';
+    }
+
+    return Card(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      color: bg,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (!connected && !busy)
+              Text(L.t('fastest'),
+                  style: tt.labelLarge
+                      ?.copyWith(color: fg.withValues(alpha: 0.85))),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                connected
+                    ? const Icon(Icons.verified_user, color: fg, size: 34)
+                    : Text(s?.flag ?? '🌐', style: const TextStyle(fontSize: 32)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(label,
+                          style: tt.titleLarge?.copyWith(
+                              color: fg, fontWeight: FontWeight.w600)),
+                      if (sub != null)
+                        Text(sub,
+                            style: tt.bodyMedium
+                                ?.copyWith(color: fg.withValues(alpha: 0.92))),
+                    ],
+                  ),
+                ),
+                if (busy || (measuring && !connected))
+                  const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: fg),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: fg,
+                foregroundColor: bg,
+                minimumSize: const Size.fromHeight(52),
+                textStyle:
+                    tt.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              onPressed: (connected || busy) ? onDisconnect : onQuickConnect,
+              icon: Icon((connected || busy) ? Icons.power_settings_new : Icons.bolt),
+              label: Text((connected || busy)
+                  ? L.t('disconnect')
+                  : L.t('quick_connect')),
+            ),
+            if (!connected && !busy) ...[
+              const SizedBox(height: 8),
+              Text(L.t('session_note'),
+                  textAlign: TextAlign.center,
+                  style: tt.bodySmall
+                      ?.copyWith(color: fg.withValues(alpha: 0.85))),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _NoticeCard extends StatelessWidget {
+  final String text;
+  final bool info;
+  final VoidCallback onClose;
+  const _NoticeCard({required this.text, required this.onClose, this.info = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final bg = info ? cs.tertiaryContainer : cs.errorContainer;
+    final fg = info ? cs.onTertiaryContainer : cs.onErrorContainer;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      color: bg,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 4, 8),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Icon(info ? Icons.info_outline : Icons.error_outline,
+                  color: fg),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 4),
+                child: Text(text, style: TextStyle(color: fg)),
+              ),
+            ),
+            IconButton(
+              icon: Icon(Icons.close, color: fg),
+              onPressed: onClose,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
 
 enum IpStatus { unknown, changed, viaServer, unchanged }
 
@@ -779,25 +1124,25 @@ class _IpCard extends StatelessWidget {
           ok.withValues(alpha: 0.16),
           cs.onSurface,
           Icons.verified_user,
-          'IP changée : vous passez par le serveur ${target!.country}'
+          L.t('ip_changed_via', {'country': target!.country})
         ),
       IpStatus.changed => (
           ok.withValues(alpha: 0.16),
           cs.onSurface,
           Icons.check_circle,
-          'IP changée'
+          L.t('ip_changed')
         ),
       IpStatus.unchanged => (
           warn.withValues(alpha: 0.16),
           cs.onSurface,
           Icons.warning_amber_rounded,
-          'IP inchangée : le VPN n\'est pas encore actif'
+          L.t('ip_unchanged')
         ),
       IpStatus.unknown => (
           cs.primaryContainer,
           cs.onPrimaryContainer,
           Icons.public,
-          'Votre IP actuelle'
+          L.t('your_ip')
         ),
     };
     final iconColor = switch (st) {
@@ -807,8 +1152,9 @@ class _IpCard extends StatelessWidget {
     };
 
     final now = ip;
+    final compare = before != null && st != IpStatus.unknown;
     return Card(
-      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
       color: bg,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 8, 14),
@@ -829,7 +1175,7 @@ class _IpCard extends StatelessWidget {
                           ?.copyWith(color: fg, fontWeight: FontWeight.w600)),
                 ),
                 IconButton(
-                  tooltip: masked ? 'Afficher l\'IP' : 'Masquer l\'IP',
+                  tooltip: masked ? L.t('show_ip') : L.t('hide_ip'),
                   icon: Icon(masked ? Icons.visibility_off : Icons.visibility,
                       color: fg),
                   onPressed: onToggleMask,
@@ -843,7 +1189,7 @@ class _IpCard extends StatelessWidget {
                             child: CircularProgressIndicator(strokeWidth: 2)),
                       )
                     : IconButton(
-                        tooltip: 'Vérifier mon IP',
+                        tooltip: L.t('check_ip'),
                         icon: Icon(Icons.refresh, color: fg),
                         onPressed: onRefresh,
                       ),
@@ -851,30 +1197,27 @@ class _IpCard extends StatelessWidget {
             ),
             const SizedBox(height: 4),
             Padding(
-              padding: const EdgeInsets.only(left: 36, right: 8),
+              padding: const EdgeInsetsDirectional.only(start: 36, end: 8),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   if (now == null)
-                    Text(failed ? 'Impossible de vérifier l\'IP pour le moment.' : 'Recherche…',
+                    Text(failed ? L.t('ip_failed') : L.t('searching'),
                         style: TextStyle(color: fg))
                   else ...[
-                    if (before != null && st != IpStatus.unknown)
-                      _IpLine(label: 'Avant', info: before!, color: fg, masked: masked, strike: st != IpStatus.unchanged),
+                    if (compare)
+                      _IpLine(
+                          label: L.t('before'),
+                          info: before!,
+                          color: fg,
+                          masked: masked,
+                          strike: st != IpStatus.unchanged),
                     _IpLine(
-                        label: before != null && st != IpStatus.unknown ? 'Maintenant' : 'IP',
+                        label: compare ? L.t('now') : L.t('ip'),
                         info: now,
                         color: fg,
                         masked: masked,
                         bold: true),
-                  ],
-                  if (st == IpStatus.unchanged) ...[
-                    const SizedBox(height: 6),
-                    Text(
-                      'Ouvrez OpenVPN for Android, touchez le profil importé pour l\'activer, '
-                      'puis revenez ici : l\'IP est revérifiée automatiquement.',
-                      style: tt.bodySmall?.copyWith(color: fg),
-                    ),
                   ],
                 ],
               ),
@@ -928,6 +1271,7 @@ class _IpLine extends StatelessWidget {
             child: Text(
               '${info.countryCode.isNotEmpty ? '${flagOf(info.countryCode)} ' : ''}'
               '$shownIp${place.isNotEmpty ? '  ·  $place' : ''}',
+              textDirection: TextDirection.ltr,
               style: TextStyle(
                 color: color,
                 fontWeight: bold ? FontWeight.w600 : FontWeight.normal,
@@ -942,53 +1286,12 @@ class _IpLine extends StatelessWidget {
   }
 }
 
-class _WarningCard extends StatelessWidget {
-  final VoidCallback onClose;
-  const _WarningCard({required this.onClose});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-      color: cs.tertiaryContainer,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 4, 8),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.only(top: 4),
-              child: Icon(Icons.info_outline, color: cs.onTertiaryContainer),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                'Ces serveurs sont prêtés par des bénévoles du projet VPN Gate. '
-                'Ne les utilisez pas pour la banque ou des données sensibles.',
-                style: TextStyle(color: cs.onTertiaryContainer),
-              ),
-            ),
-            IconButton(
-              tooltip: 'Masquer',
-              icon: Icon(Icons.close, color: cs.onTertiaryContainer),
-              onPressed: onClose,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _CountryChips extends StatelessWidget {
   final List<MapEntry<String, int>> countries;
   final String? selected;
   final ValueChanged<String?> onSelected;
   const _CountryChips(
       {required this.countries, required this.selected, required this.onSelected});
-
-  String _flag(String cc) => flagOf(cc);
 
   @override
   Widget build(BuildContext context) {
@@ -999,18 +1302,18 @@ class _CountryChips extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         children: [
           Padding(
-            padding: const EdgeInsets.only(right: 8),
+            padding: const EdgeInsetsDirectional.only(end: 8),
             child: ChoiceChip(
-              label: const Text('Tous les pays'),
+              label: Text(L.t('all_countries')),
               selected: selected == null,
               onSelected: (_) => onSelected(null),
             ),
           ),
           for (final c in countries)
             Padding(
-              padding: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsetsDirectional.only(end: 8),
               child: ChoiceChip(
-                label: Text('${_flag(c.key)} ${c.key} (${c.value})'),
+                label: Text('${flagOf(c.key)} ${c.key} (${c.value})'),
                 selected: selected == c.key,
                 onSelected: (_) => onSelected(c.key),
               ),
@@ -1021,100 +1324,17 @@ class _CountryChips extends StatelessWidget {
   }
 }
 
-String latencyLabel(VpnServer s, int? latency) {
-  if (latency == -1) return 'injoignable';
-  if (latency != null && latency > 0) return '$latency ms';
-  return s.ping > 0 ? '~${s.ping} ms' : '?';
-}
-
-class _QuickConnectCard extends StatelessWidget {
-  final VpnServer? server;
-  final int? latency;
-  final bool measuring;
-  final VoidCallback? onConnect;
-  const _QuickConnectCard({
-    required this.server,
-    required this.latency,
-    required this.measuring,
-    required this.onConnect,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final tt = Theme.of(context).textTheme;
-    final s = server;
-    return Card(
-      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-      color: cs.primary,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text('Serveur le plus rapide pour vous',
-                style: tt.labelLarge?.copyWith(color: cs.onPrimary.withValues(alpha: 0.8))),
-            const SizedBox(height: 6),
-            Row(
-              children: [
-                Text(s?.flag ?? '🌐', style: const TextStyle(fontSize: 32)),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(s?.country ?? 'Recherche…',
-                          style: tt.titleLarge?.copyWith(
-                              color: cs.onPrimary, fontWeight: FontWeight.w600)),
-                      if (s != null)
-                        Text(
-                          '${s.speedMbps.toStringAsFixed(0)} Mb/s · ping ${latencyLabel(s, latency)}',
-                          style: tt.bodyMedium?.copyWith(color: cs.onPrimary),
-                        ),
-                    ],
-                  ),
-                ),
-                if (measuring)
-                  SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: cs.onPrimary),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            FilledButton.icon(
-              style: FilledButton.styleFrom(
-                backgroundColor: cs.onPrimary,
-                foregroundColor: cs.primary,
-                minimumSize: const Size.fromHeight(52),
-                textStyle: tt.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-              ),
-              onPressed: onConnect,
-              icon: const Icon(Icons.bolt),
-              label: const Text('Connexion rapide'),
-            ),
-            const SizedBox(height: 8),
-            Text('Session gratuite de 4 h, puis reconnexion en un geste.',
-                textAlign: TextAlign.center,
-                style: tt.bodySmall?.copyWith(color: cs.onPrimary.withValues(alpha: 0.85))),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _ServerTile extends StatelessWidget {
   final VpnServer server;
   final int? latency;
   final bool isFastest;
+  final bool isActive;
   final VoidCallback onTap;
   const _ServerTile({
     required this.server,
     required this.latency,
     required this.isFastest,
+    required this.isActive,
     required this.onTap,
   });
 
@@ -1123,6 +1343,19 @@ class _ServerTile extends StatelessWidget {
     final s = server;
     final cs = Theme.of(context).colorScheme;
     final dead = latency == -1;
+    Widget trailing;
+    if (isActive) {
+      trailing = const Icon(Icons.verified_user, color: Color(0xFF1E8E3E));
+    } else if (isFastest) {
+      trailing = Chip(
+        label: Text(L.t('fastest_badge')),
+        visualDensity: VisualDensity.compact,
+        backgroundColor: cs.primaryContainer,
+        side: BorderSide.none,
+      );
+    } else {
+      trailing = const Icon(Icons.chevron_right);
+    }
     return Opacity(
       opacity: dead ? 0.45 : 1,
       child: ListTile(
@@ -1132,16 +1365,9 @@ class _ServerTile extends StatelessWidget {
         subtitle: Text(
           '${s.speedMbps.toStringAsFixed(1)} Mb/s · '
           'ping ${latencyLabel(s, latency)} · '
-          '${s.sessions} connectés',
+          '${L.t('users', {'n': s.sessions})}',
         ),
-        trailing: isFastest
-            ? Chip(
-                label: const Text('Le + rapide'),
-                visualDensity: VisualDensity.compact,
-                backgroundColor: cs.primaryContainer,
-                side: BorderSide.none,
-              )
-            : const Icon(Icons.chevron_right),
+        trailing: trailing,
       ),
     );
   }
@@ -1150,10 +1376,12 @@ class _ServerTile extends StatelessWidget {
 class _ConnectSheet extends StatelessWidget {
   final VpnServer server;
   final int? latency;
+  final bool switching;
   final VoidCallback onConnect;
   const _ConnectSheet({
     required this.server,
     required this.latency,
+    required this.switching,
     required this.onConnect,
   });
 
@@ -1177,34 +1405,30 @@ class _ConnectSheet extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(s.country, style: tt.titleLarge),
-                      Text(s.ip, style: tt.titleMedium),
+                      Text(s.ip,
+                          textDirection: TextDirection.ltr,
+                          style: tt.titleMedium),
                     ],
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 16),
-            _Info('Vitesse', '${s.speedMbps.toStringAsFixed(1)} Mb/s'),
-            _Info('Ping depuis votre appareil', latencyLabel(s, latency)),
-            _Info('Chiffrement',
-                'AES-256-GCM prioritaire (repli ${s.serverCipher})'),
-            _Info('Utilisateurs connectés', '${s.sessions}'),
-            _Info('En ligne depuis', s.uptimeLabel),
-            const SizedBox(height: 16),
-            Text(
-              '1. « Se connecter » ouvre le serveur dans OpenVPN for Android.\n'
-              '2. Validez l\'import (coche en haut à droite).\n'
-              '3. Touchez le profil pour vous connecter, puis revenez dans Hopora : votre IP est vérifiée automatiquement.\n'
-              'La session gratuite dure 4 h maximum, puis se reconnecte depuis Hopora.',
-              style: tt.bodyMedium,
-            ),
+            _Info(L.t('speed'), '${s.speedMbps.toStringAsFixed(1)} Mb/s'),
+            _Info(L.t('ping_device'), latencyLabel(s, latency)),
+            _Info(L.t('encryption'), L.t('enc_value', {'c': s.serverCipher})),
+            _Info('👥', L.t('users', {'n': s.sessions})),
+            _Info(L.t('online_since'), s.uptimeLabel),
+            const SizedBox(height: 12),
+            Text(L.t('session_note'), style: tt.bodyMedium),
             const SizedBox(height: 16),
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
                 onPressed: onConnect,
                 icon: const Icon(Icons.vpn_lock),
-                label: const Text('Se connecter'),
+                label: Text(
+                    switching ? L.t('switch_server') : L.t('connect')),
               ),
             ),
           ],
@@ -1229,7 +1453,7 @@ class _Info extends StatelessWidget {
               child: Text(label,
                   style: TextStyle(
                       color: Theme.of(context).colorScheme.onSurfaceVariant))),
-          Flexible(child: Text(value, textAlign: TextAlign.right)),
+          Flexible(child: Text(value, textAlign: TextAlign.end)),
         ],
       ),
     );
@@ -1253,13 +1477,9 @@ class _ErrorView extends StatelessWidget {
             const SizedBox(height: 16),
             Text(message, textAlign: TextAlign.center),
             const SizedBox(height: 8),
-            const Text(
-              'Vérifiez votre connexion Internet. Si vous êtes déjà connecté à un VPN, '
-              'déconnectez-le puis réessayez.',
-              textAlign: TextAlign.center,
-            ),
+            Text(L.t('error_hint'), textAlign: TextAlign.center),
             const SizedBox(height: 16),
-            FilledButton(onPressed: onRetry, child: const Text('Réessayer')),
+            FilledButton(onPressed: onRetry, child: Text(L.t('retry'))),
           ],
         ),
       ),
