@@ -216,37 +216,57 @@ class VpnServer {
     return m?.group(1) ?? 'AES';
   }
 
-  /// Profil renforce : AES-256-GCM / ChaCha20 en priorite (repli sur le
-  /// chiffrement d'origine) et session limitee a 4 h.
-  String get hardenedConfig {
-    final fallback = serverCipher.toUpperCase();
-    final ciphers = <String>[
-      'AES-256-GCM',
-      'CHACHA20-POLY1305',
-      'AES-128-GCM',
-      if (!['AES-256-GCM', 'CHACHA20-POLY1305', 'AES-128-GCM', 'AES']
-          .contains(fallback))
-        fallback,
+  /// Profil OpenVPN optimise.
+  ///
+  /// Les serveurs VPN Gate (SoftEther) ne gerent que les chiffrements AES-CBC
+  /// en mode OpenVPN, sans negociation. [strong] force AES-256-CBC, le plus
+  /// fort qu'ils acceptent ; sinon on garde le chiffrement annonce par le
+  /// serveur. Sur les telephones recents, AES est accelere par le processeur :
+  /// passer de 128 a 256 bits ne ralentit pas la connexion.
+  String buildConfig({required bool strong}) {
+    final cipher = strong ? 'AES-256-CBC' : serverCipher.toUpperCase();
+    const drop = [
+      'cipher', 'data-ciphers', 'ncp-', 'session-timeout', 'inactive',
+      'ignore-unknown-option', 'sndbuf', 'rcvbuf', 'connect-retry',
+      'connect-timeout', 'server-poll-timeout', 'tls-version-min',
+      'pull-filter', 'dhcp-option', 'block-outside-dns',
     ];
     final lines = rawConfig.split(RegExp(r'\r?\n')).where((l) {
       final t = l.trimLeft();
-      return !t.startsWith('data-ciphers') &&
-          !t.startsWith('session-timeout') &&
-          !t.startsWith('inactive') &&
-          !t.startsWith('ignore-unknown-option');
+      return !drop.any(t.startsWith);
     });
     return [
       // Options recentes ignorees si le moteur OpenVPN ne les connait pas.
-      'ignore-unknown-option data-ciphers session-timeout',
-      'data-ciphers ${ciphers.join(':')}',
+      'ignore-unknown-option data-ciphers data-ciphers-fallback session-timeout',
+      // --- Chiffrement ---
+      'cipher $cipher',
+      'data-ciphers $cipher',
+      'data-ciphers-fallback $cipher',
+      'tls-version-min 1.2',
+      // --- Vitesse : tampons reseau geres par le systeme (plus rapides que
+      // les valeurs par defaut d'OpenVPN sur les liaisons lointaines) ---
+      'sndbuf 0',
+      'rcvbuf 0',
+      // --- Echec rapide pour basculer vite sur un autre serveur ---
+      'connect-timeout 10',
+      'server-poll-timeout 10',
+      'connect-retry-max 1',
+      // --- DNS securise Quad9 (bloque les domaines malveillants) a la
+      // place du DNS du serveur benevole ---
+      'pull-filter ignore "dhcp-option DNS"',
+      'dhcp-option DNS 9.9.9.9',
+      'dhcp-option DNS 149.112.112.112',
+      // --- Session gratuite limitee a 4 h ---
       'session-timeout $maxSessionSeconds',
-      // Secours pour les moteurs sans session-timeout : coupe apres 4 h
-      // (seuil de trafic volontairement inatteignable, 1 To).
       'inactive $maxSessionSeconds 1000000000000',
       ...lines,
       '',
     ].join('\n');
   }
+
+  /// Nom lisible du chiffrement (ex. AES-128-CBC -> AES-128).
+  static String cipherLabel(String c) =>
+      c.toUpperCase().replaceAll(RegExp(r'-(CBC|GCM)$'), '');
 
   String get uptimeLabel {
     final days = uptimeMs ~/ 86400000;
@@ -316,13 +336,14 @@ class VpnGateApi {
   }
 
   /// IP publique actuelle + pays (ipwho.is), repli sur ipify (IP seule).
-  static Future<IpInfo?> currentIp() async {
+  static Future<IpInfo?> currentIp(
+      {Duration timeout = const Duration(seconds: 10)}) async {
     final nonce = DateTime.now().millisecondsSinceEpoch;
     try {
       final res = await http
           .get(Uri.parse('https://ipwho.is/?lang=${L.lang}&_=$nonce'),
               headers: {'Cache-Control': 'no-cache'})
-          .timeout(const Duration(seconds: 10));
+          .timeout(timeout);
       if (res.statusCode == 200) {
         final j =
             jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
@@ -341,7 +362,7 @@ class VpnGateApi {
     try {
       final res = await http
           .get(Uri.parse('https://api.ipify.org?format=json&_=$nonce'))
-          .timeout(const Duration(seconds: 10));
+          .timeout(timeout);
       if (res.statusCode == 200) {
         final ip =
             (jsonDecode(res.body) as Map<String, dynamic>)['ip'] as String?;
@@ -451,6 +472,16 @@ class _ServerListPageState extends State<ServerListPage>
   Timer? _tick;
   String? _notice;
 
+  // Tentative en cours : chiffrement force ou non, verification, bascule.
+  int _attempt = 0;
+  bool _strong = true;
+  bool _verified = false;
+  bool _switching = false;
+  int _failovers = 0;
+  Timer? _connectTimeout;
+  String? _cipherInUse; // chiffrement reellement utilise (tunnel verifie)
+  final Set<String> _failedIps = {};
+
   bool get _isConnected => _stage == VPNStage.connected;
   bool get _isBusy => _busyStages.contains(_stage);
 
@@ -479,6 +510,7 @@ class _ServerListPageState extends State<ServerListPage>
     WidgetsBinding.instance.removeObserver(this);
     _sessionTimer?.cancel();
     _tick?.cancel();
+    _connectTimeout?.cancel();
     super.dispose();
   }
 
@@ -502,25 +534,161 @@ class _ServerListPageState extends State<ServerListPage>
 
   void _onVpnStage(VPNStage stage, String raw) {
     if (!mounted) return;
+    // Pendant une bascule volontaire, on ignore la deconnexion intermediaire.
+    if (_switching && stage == VPNStage.disconnected) return;
     final was = _stage;
-    setState(() {
-      _stage = stage;
-      if (stage == VPNStage.denied) _notice = L.t('vpn_denied');
-      if (stage == VPNStage.error) _notice = L.t('vpn_error');
-    });
+    final id = _attempt;
+    setState(() => _stage = stage);
+
+    if (stage == VPNStage.denied) {
+      _connectTimeout?.cancel();
+      setState(() => _notice = L.t('vpn_denied'));
+      return;
+    }
+    // Le delai ne demarre qu'une fois l'autorisation Android accordee
+    // (le moteur envoie alors ses premieres etapes).
+    if (_busyStages.contains(stage) && stage != VPNStage.prepare &&
+        _connectTimeout == null && _active != null) {
+      _connectTimeout = Timer(const Duration(seconds: 25), () {
+        if (id == _attempt && !_isConnected) _attemptFailed(id);
+      });
+    }
     if (stage == VPNStage.connected) {
+      _connectTimeout?.cancel();
+      _connectTimeout = null;
       _connectedAt ??= DateTime.now();
       _armSession();
-      Future.delayed(const Duration(seconds: 2), _refreshIp);
+      _verifyTunnel(id);
+    } else if (stage == VPNStage.error) {
+      _attemptFailed(id);
     } else if (stage == VPNStage.disconnected) {
       _sessionTimer?.cancel();
       _tick?.cancel();
       _tick = null;
+      _connectTimeout?.cancel();
+      _connectTimeout = null;
       _connectedAt = null;
-      if (was == VPNStage.connected) {
+      _cipherInUse = null;
+      // Coupure pendant la connexion (serveur qui refuse) : on bascule.
+      if (_busyStages.contains(was) && was != VPNStage.prepare && _active != null) {
+        _attemptFailed(id);
+      } else if (was == VPNStage.connected) {
         Future.delayed(const Duration(seconds: 2), _refreshIp);
       }
     }
+  }
+
+  /// Verifie que le trafic passe vraiment par le tunnel (l'IP doit changer).
+  /// Un serveur qui refuse le chiffrement AES-256 « se connecte » mais ne
+  /// transmet rien : dans ce cas on recommence avec son propre chiffrement.
+  Future<void> _verifyTunnel(int id) async {
+    final s = _active;
+    if (s == null) return;
+    _verified = false;
+    await Future.delayed(const Duration(seconds: 2));
+    for (var i = 0; i < 2; i++) {
+      if (!mounted || id != _attempt) return;
+      final ip =
+          await VpnGateApi.currentIp(timeout: const Duration(seconds: 5));
+      if (!mounted || id != _attempt) return;
+      if (ip != null && ip.ip != _ipBefore?.ip) {
+        setState(() {
+          _verified = true;
+          _myIp = ip;
+          _ipFailed = false;
+          _failovers = 0;
+          _cipherInUse = _strong ? 'AES-256-CBC' : s.serverCipher.toUpperCase();
+        });
+        return;
+      }
+      await Future.delayed(const Duration(seconds: 3));
+    }
+    _attemptFailed(id);
+  }
+
+  /// Echec d'une tentative : AES-256 refuse -> chiffrement du serveur ;
+  /// serveur muet -> serveur suivant le plus rapide (2 bascules maximum).
+  void _attemptFailed(int id) {
+    if (!mounted || id != _attempt) return;
+    final s = _active;
+    if (s == null) return;
+    _connectTimeout?.cancel();
+    _connectTimeout = null;
+    if (_strong && !s.serverCipher.toUpperCase().contains('256')) {
+      _restart(s, strong: false);
+      return;
+    }
+    _failedIps.add(s.ip);
+    final next = _fastestExcluding(_failedIps);
+    if (next != null && _failovers < 2) {
+      _failovers++;
+      setState(() {
+        _notice = L.t('retrying');
+        _target = next;
+      });
+      _restart(next, strong: true);
+    } else {
+      _attempt++;
+      _vpn.disconnect();
+      setState(() {
+        _notice = L.t('vpn_error');
+        _active = null;
+        _failovers = 0;
+      });
+    }
+  }
+
+  Future<void> _restart(VpnServer s, {required bool strong}) async {
+    _switching = true;
+    _vpn.disconnect();
+    await Future.delayed(const Duration(milliseconds: 900));
+    _switching = false;
+    if (mounted) _startAttempt(s, strong: strong);
+  }
+
+  void _startAttempt(VpnServer s, {required bool strong}) {
+    _attempt++;
+    _connectTimeout?.cancel();
+    _connectTimeout = null;
+    setState(() {
+      _active = s;
+      _strong = strong;
+      _verified = false;
+      _cipherInUse = null;
+      _connectedAt = null;
+      _stage = VPNStage.prepare;
+    });
+    try {
+      // Pas d'await : si Android demande l'autorisation VPN, l'appel
+      // ne renvoie jamais de reponse ; la connexion reprend apres accord.
+      unawaited(_vpn
+          .connect(
+            s.buildConfig(strong: strong),
+            '${s.country} · Hopora',
+            username: 'vpn',
+            password: 'vpn',
+            certIsRequired: s.certRequired,
+          )
+          .catchError((_) {
+        if (mounted) setState(() => _notice = L.t('vpn_error'));
+      }));
+    } catch (_) {
+      setState(() => _notice = L.t('vpn_error'));
+    }
+  }
+
+  VpnServer? _fastestExcluding(Set<String> ips) {
+    VpnServer? best;
+    var bestQ = -1.0;
+    for (final s in _all) {
+      if (ips.contains(s.ip)) continue;
+      final q = _quality(s);
+      if (q > bestQ) {
+        bestQ = q;
+        best = s;
+      }
+    }
+    return bestQ > 0 ? best : null;
   }
 
   /// Programme la coupure automatique a 4 h et le rafraichissement du compteur.
@@ -540,6 +708,7 @@ class _ServerListPageState extends State<ServerListPage>
   }
 
   void _endSession() {
+    _attempt++;
     _vpn.disconnect();
     if (mounted) setState(() => _notice = L.t('session_over'));
   }
@@ -551,48 +720,60 @@ class _ServerListPageState extends State<ServerListPage>
       if (ok != true) return;
       await prefs.setBool('vpn_consent', true);
     }
-    // IP de reference prise avant de se connecter.
-    final before = _isConnected ? _ipBefore : await VpnGateApi.currentIp() ?? _myIp;
+    // IP de reference prise avant de se connecter (hors VPN).
+    final before =
+        (_isConnected || _isBusy) ? _ipBefore : await VpnGateApi.currentIp() ?? _myIp;
     if (!mounted) return;
     setState(() {
       _ipBefore = before;
       _target = s;
       _notice = null;
+      _failovers = 0;
+      _failedIps.clear();
     });
     await AdsManager.showThen(() async {
       if (_isConnected || _isBusy) {
-        _vpn.disconnect();
-        await Future.delayed(const Duration(milliseconds: 800));
-      }
-      if (!mounted) return;
-      setState(() {
-        _active = s;
-        _connectedAt = null;
-        _stage = VPNStage.prepare;
-      });
-      try {
-        // Pas d'await : si Android demande l'autorisation VPN, l'appel
-        // ne renvoie jamais de reponse ; la connexion reprend apres accord.
-        unawaited(_vpn
-            .connect(
-              s.hardenedConfig,
-              '${s.country} · Hopora',
-              username: 'vpn',
-              password: 'vpn',
-              certIsRequired: s.certRequired,
-            )
-            .catchError((_) {
-          if (mounted) setState(() => _notice = L.t('vpn_error'));
-        }));
-      } catch (_) {
-        if (mounted) setState(() => _notice = L.t('vpn_error'));
+        await _restart(s, strong: true);
+      } else if (mounted) {
+        _startAttempt(s, strong: true);
       }
     });
   }
 
   void _disconnect() {
+    _attempt++; // annule verification et bascules en cours
+    _connectTimeout?.cancel();
+    _connectTimeout = null;
     _vpn.disconnect();
     _sessionTimer?.cancel();
+    setState(() {
+      _active = null;
+      _cipherInUse = null;
+    });
+  }
+
+  Future<void> _openKillSwitch() async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.shield_outlined),
+        title: Text(L.t('p_killswitch')),
+        content: Text(L.t('killswitch_help')),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text(L.t('cancel'))),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text(L.t('enable'))),
+        ],
+      ),
+    );
+    if (go == true) {
+      try {
+        await _secureChannel.invokeMethod('vpnSettings');
+      } catch (_) {}
+    }
   }
 
   Future<bool?> _showConsent() {
@@ -775,6 +956,16 @@ class _ServerListPageState extends State<ServerListPage>
                       await _secureChannel.invokeMethod('set', v);
                     } catch (_) {}
                     setSheet(() {});
+                    if (mounted) setState(() {});
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.shield_outlined),
+                  title: Text(L.t('p_killswitch')),
+                  subtitle: Text(L.t('p_killswitch_desc')),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _openKillSwitch();
                   },
                 ),
                 ListTile(
@@ -859,6 +1050,13 @@ class _ServerListPageState extends State<ServerListPage>
                         onToggleMask: () =>
                             setState(() => _revealIp = !_revealIp),
                         onRefresh: _refreshIp,
+                      ),
+                      _ShieldCard(
+                        connected: _isConnected,
+                        verified: _verified,
+                        cipherInUse: _cipherInUse,
+                        discreet: prefs.getBool('discreet') ?? true,
+                        onKillSwitch: _openKillSwitch,
                       ),
                       if (_showWarning)
                         _NoticeCard(
@@ -1073,6 +1271,103 @@ class _NoticeCard extends StatelessWidget {
               icon: Icon(Icons.close, color: fg),
               onPressed: onClose,
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ShieldCard extends StatelessWidget {
+  final bool connected;
+  final bool verified;
+  final String? cipherInUse;
+  final bool discreet;
+  final VoidCallback onKillSwitch;
+  const _ShieldCard({
+    required this.connected,
+    required this.verified,
+    required this.cipherInUse,
+    required this.discreet,
+    required this.onKillSwitch,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    const ok = Color(0xFF1E8E3E);
+    const warn = Color(0xFFE37400);
+
+    // Chiffrement : on n'affiche que ce qui a ete reellement verifie.
+    String cipherText;
+    Color cipherColor;
+    final c = cipherInUse;
+    if (connected && verified && c != null) {
+      final strong = c.contains('256');
+      cipherText = strong
+          ? L.t('cipher_strong')
+          : L.t('cipher_server', {'c': VpnServer.cipherLabel(c)});
+      cipherColor = strong ? ok : warn;
+    } else {
+      cipherText = L.t('cipher_auto');
+      cipherColor = cs.primary;
+    }
+
+    Widget row(IconData icon, Color color, String title, String? sub,
+        {Widget? trailing}) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: color, size: 22),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: tt.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+                  if (sub != null)
+                    Text(sub,
+                        style: tt.bodySmall
+                            ?.copyWith(color: cs.onSurfaceVariant)),
+                ],
+              ),
+            ),
+            if (trailing != null) trailing,
+          ],
+        ),
+      );
+    }
+
+    return Card(
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 14, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.shield, color: connected ? ok : cs.primary),
+                const SizedBox(width: 10),
+                Text(L.t('shield_title'),
+                    style: tt.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+              ],
+            ),
+            const SizedBox(height: 8),
+            row(Icons.lock, cipherColor, L.t('encryption'), cipherText),
+            row(Icons.dns_outlined, ok, L.t('p_dns'), L.t('p_dns_desc')),
+            row(Icons.block, ok, L.t('p_ipv6'), null),
+            row(Icons.swap_horiz, ok, L.t('p_failover'), null),
+            row(Icons.visibility_off_outlined, discreet ? ok : cs.outline,
+                L.t('discreet_mode'), discreet ? L.t('on') : L.t('off')),
+            row(Icons.power_off_outlined, cs.outline, L.t('p_killswitch'),
+                L.t('p_killswitch_desc'),
+                trailing: TextButton(
+                    onPressed: onKillSwitch, child: Text(L.t('enable')))),
           ],
         ),
       ),

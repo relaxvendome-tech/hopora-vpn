@@ -2,6 +2,7 @@ package PACKAGE_NAME
 
 import android.content.Intent
 import android.os.Bundle
+import android.provider.Settings
 import android.view.WindowManager
 import id.laskarmedia.openvpn_flutter.OpenVPNFlutterPlugin
 import io.flutter.embedding.android.FlutterActivity
@@ -28,6 +29,14 @@ class MainActivity : FlutterActivity() {
                         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     } else {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    }
+                    result.success(null)
+                } else if (call.method == "vpnSettings") {
+                    // Reglage Android « VPN permanent » + « Bloquer sans VPN » (kill switch)
+                    try {
+                        startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                    } catch (e: Exception) {
+                        startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
                     }
                     result.success(null)
                 } else {
