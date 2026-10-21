@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   build:
+    # "[e2e-only]" dans le message de commit : on relance seulement le test.
+    if: ${{ !contains(github.event.head_commit.message, '[e2e-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -94,8 +96,9 @@ jobs:
     # confirmee par check.torproject.org. Les captures sont deposees dans la
     # branche hopora-e2e.
     needs: build
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 
@@ -111,16 +114,20 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "PAS DE KVM"
 
       - name: Test de bout en bout
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 34
+          api-level: 31
           target: google_apis
           arch: x86_64
           profile: pixel_6
+          ram-size: 4096M
+          disk-size: 6000M
+          emulator-boot-timeout: 1200
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           script: bash ci/e2e.sh app-release.apk e2e-out
 
       - name: Deposer les resultats dans la branche hopora-e2e
