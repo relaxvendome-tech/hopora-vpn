@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       # Vos identifiants AdMob (Settings > Secrets and variables > Actions).
       # Sans secrets, les identifiants de TEST de Google sont utilises.
@@ -52,14 +53,16 @@ jobs:
       - name: Construire
         run: |
           UNIT="${ADMOB_INTERSTITIAL_ID:-ca-app-pub-3940256099942544/1033173712}"
+          (while true; do echo "$(date +%T) $(free -m | sed -n 2p)" >> mem.log; sleep 20; done) &
           set -o pipefail
           flutter build apk --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee build.log
           flutter build appbundle --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee -a build.log
 
       - name: Remonter les erreurs
-        if: failure()
+        if: failure() || cancelled()
         run: |
-          touch build.log
+          touch build.log mem.log
+          tail -5 mem.log >> build.log
           { grep -nE "rror|What went wrong|FAILURE|xception|\.dart:[0-9]+|Could not|requires|incompatible" build.log | head -60; echo "----- FIN DU JOURNAL -----"; tail -50 build.log; } > err.txt || true
           MSG=$(sed 's/%/%25/g; s/\r//g' err.txt | awk '{printf "%s%%0A", $0}')
           echo "::error title=Build::${MSG}"

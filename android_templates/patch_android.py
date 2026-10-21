@@ -99,7 +99,13 @@ for g in glob.glob("android/build.gradle*"):
     print(s2)
 
 with open("android/gradle.properties", "a") as gp:
-    gp.write("\nandroid.suppressUnsupportedCompileSdk=37\n")
+    gp.write("\nandroid.suppressUnsupportedCompileSdk=37\n"
+             "org.gradle.workers.max=3\n"
+             "kotlin.daemon.jvmargs=-Xmx1536m\n")
+gpp = open("android/gradle.properties").read()
+gpp = re.sub(r"^org\.gradle\.jvmargs=.*$", "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError", gpp, flags=re.M)
+open("android/gradle.properties", "w").write(gpp)
+print(gpp)
 
 # --- MainActivity ---
 mas = glob.glob("android/app/src/main/**/MainActivity.kt", recursive=True)
