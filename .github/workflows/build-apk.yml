@@ -2,7 +2,11 @@ name: Construire l'APK Hopora
 
 on:
   push:
+    branches: [hopora-vpn]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -64,3 +68,14 @@ jobs:
         with:
           name: HoporaVPN-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Deposer l'APK dans la branche hopora-apk
+        run: |
+          mkdir -p /tmp/out && cp build/app/outputs/flutter-apk/app-release.apk /tmp/out/HoporaVPN.apk
+          cd /tmp/out
+          git init -q -b hopora-apk
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add HoporaVPN.apk
+          git commit -q -m "APK Hopora VPN ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" hopora-apk
