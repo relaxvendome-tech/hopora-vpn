@@ -39,6 +39,8 @@ open(m_path, "w").write(m)
 for g in glob.glob("android/app/build.gradle*"):
     s = open(g).read()
     s = re.sub(r"minSdk(Version)?\s*=?\s*flutter\.minSdkVersion", "minSdk = 24", s)
+    # tor-android 0.4.9.14 exige de compiler avec l'API 37 (cible inchangee).
+    s = re.sub(r"compileSdk(Version)?\s*=?\s*flutter\.compileSdkVersion", "compileSdk = 37", s)
     kts = g.endswith(".kts")
     block = ("\n    packaging {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n"
              if kts else
@@ -95,6 +97,9 @@ for g in glob.glob("android/build.gradle*"):
                     r'\1\n        maven { url = uri("${rootDir}/localmaven") }', s2, count=1)
     open(g, "w").write(s2)
     print(s2)
+
+with open("android/gradle.properties", "a") as gp:
+    gp.write("\nandroid.suppressUnsupportedCompileSdk=37\n")
 
 # --- MainActivity ---
 mas = glob.glob("android/app/src/main/**/MainActivity.kt", recursive=True)
