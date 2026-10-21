@@ -1,0 +1,11 @@
+# Mode Tor : classes appelees par du code natif (JNI) ou par Go (gomobile).
+-keep class PACKAGE_NAME.TProxyService { *; }
+-keep class PACKAGE_NAME.TorVpnService { *; }
+-keep class org.torproject.jni.** { *; }
+-keep class net.freehaven.tor.control.** { *; }
+-keep class IPtProxy.** { *; }
+-keep class go.** { *; }
+-keep class de.blinkt.openvpn.** { *; }
+-dontwarn org.torproject.**
+-dontwarn IPtProxy.**
+-dontwarn go.**

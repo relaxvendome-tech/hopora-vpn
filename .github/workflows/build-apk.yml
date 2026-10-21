@@ -38,6 +38,11 @@ jobs:
           flutter pub get
           grep -A12 "^dependencies:" pubspec.yaml
 
+      - name: Moteur tun2socks du mode Tor (hev-socks5-tunnel)
+        run: |
+          git clone -q --depth 1 --branch 2.19.1 --recursive --shallow-submodules \
+            https://github.com/heiher/hev-socks5-tunnel.git android/app/src/main/jni/hev-socks5-tunnel
+
       - name: Configurer Android (VPN, discretion, AdMob, icone)
         run: |
           python3 android_templates/patch_android.py

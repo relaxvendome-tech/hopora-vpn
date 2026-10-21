@@ -21,7 +21,11 @@ m = m.replace('android:label="hopora_vpn"',
               'android:label="Hopora VPN" android:usesCleartextTraffic="true" '
               'android:allowBackup="false" android:fullBackupContent="false"', 1)
 service = (
-    '    <service android:name="de.blinkt.openvpn.core.OpenVPNService"\n'
+    '    <service android:name=".TorVpnService"\n'
+    '            android:permission="android.permission.BIND_VPN_SERVICE"\n'
+    '            android:foregroundServiceType="systemExempted"\n'
+    '            android:exported="false" />\n'
+    '        <service android:name="de.blinkt.openvpn.core.OpenVPNService"\n'
     '            android:foregroundServiceType="systemExempted"\n'
     '            tools:replace="android:foregroundServiceType"\n'
     '            tools:node="merge" />\n'
@@ -41,8 +45,28 @@ for g in glob.glob("android/app/build.gradle*"):
              "\n    packagingOptions {\n        jniLibs {\n            useLegacyPackaging = true\n        }\n    }\n")
     if "useLegacyPackaging" not in s:
         s = re.sub(r"(android\s*\{)", r"\1" + block, s, count=1)
+    # Mode Tor : tun2socks natif (hev-socks5-tunnel) + Tor + ponts anti-censure
+    if kts and "ndkBuild" not in s:
+        native = ('\n    externalNativeBuild {\n        ndkBuild {\n'
+                  '            path = file("src/main/jni/Android.mk")\n        }\n    }\n')
+        s = re.sub(r"(android\s*\{)", r"\1" + native, s, count=1)
+        s += ('\ndependencies {\n'
+              '    implementation("info.guardianproject:tor-android:0.4.9.14")\n'
+              '    implementation("info.guardianproject:jtorctl:0.4.5.7")\n'
+              '    implementation("com.netzarchitekten:IPtProxy:5.7.0")\n'
+              '}\n')
     open(g, "w").write(s)
     print("patched", g)
+
+# --- Depots Maven (Guardian Project) ---
+for g in glob.glob("android/build.gradle*"):
+    s = open(g).read()
+    if "gpmaven" not in s:
+        s = re.sub(r"(allprojects\s*\{\s*repositories\s*\{)",
+                   r'\1\n        maven { url = uri("https://raw.githubusercontent.com/guardianproject/gpmaven/master") }',
+                   s, count=1)
+    open(g, "w").write(s)
+    print(s)
 
 # --- MainActivity ---
 mas = glob.glob("android/app/src/main/**/MainActivity.kt", recursive=True)
@@ -53,4 +77,18 @@ pkg = re.search(r"^package\s+(\S+)", open(ma).read(), re.M).group(1)
 tpl = open("android_templates/MainActivity.kt").read().replace("PACKAGE_NAME", pkg)
 open(ma, "w").write(tpl)
 print("MainActivity ->", ma, pkg)
+
+# --- Mode Tor : service Kotlin, JNI, regles R8 ---
+src_dir = os.path.dirname(ma)
+t = open("android_templates/tor/TorVpnService.kt").read().replace("PACKAGE_NAME", pkg)
+open(os.path.join(src_dir, "TorVpnService.kt"), "w").write(t)
+jni = "android/app/src/main/jni"
+os.makedirs(jni, exist_ok=True)
+open(os.path.join(jni, "Android.mk"), "w").write(open("android_templates/tor/Android.mk").read())
+open(os.path.join(jni, "Application.mk"), "w").write(
+    open("android_templates/tor/Application.mk").read().replace("PKG_PATH", pkg.replace(".", "/")))
+open("android/app/proguard-rules.pro", "w").write(
+    open("android_templates/tor/proguard-rules.pro").read().replace("PACKAGE_NAME", pkg))
+for g in glob.glob("android/app/build.gradle*"):
+    print(open(g).read())
 print(m)
