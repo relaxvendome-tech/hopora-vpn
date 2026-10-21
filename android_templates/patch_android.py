@@ -68,6 +68,34 @@ for g in glob.glob("android/build.gradle*"):
     open(g, "w").write(s)
     print(s)
 
+# --- openvpn_library embarque une libgojni.so inutilisee qui entre en conflit
+#     avec celle des ponts Tor (IPtProxy). On sert une copie nettoyee de l'AAR
+#     depuis un depot Maven local, consulte en premier.
+import json, urllib.request, zipfile
+deps = json.load(open(".flutter-plugins-dependencies"))
+ovpn = [x for x in deps["plugins"]["android"] if x["name"] == "openvpn_flutter"][0]["path"]
+ver = re.search(r"openvpn_library:([^'\"]+)", open(os.path.join(ovpn, "android", "build.gradle")).read()).group(1)
+repo_dir = os.path.abspath("android/localmaven/com/github/nizwar/openvpn_library/" + ver)
+os.makedirs(repo_dir, exist_ok=True)
+base = f"https://jitpack.io/com/github/nizwar/openvpn_library/{ver}/openvpn_library-{ver}"
+urllib.request.urlretrieve(base + ".pom", os.path.join(repo_dir, f"openvpn_library-{ver}.pom"))
+raw = os.path.join(repo_dir, "raw.aar")
+urllib.request.urlretrieve(base + ".aar", raw)
+with zipfile.ZipFile(raw) as zin, zipfile.ZipFile(os.path.join(repo_dir, f"openvpn_library-{ver}.aar"), "w", zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        if item.filename.endswith("libgojni.so"):
+            print("retire", item.filename)
+            continue
+        zout.writestr(item, zin.read(item.filename))
+os.remove(raw)
+for g in glob.glob("android/build.gradle*"):
+    s2 = open(g).read()
+    if "localmaven" not in s2:
+        s2 = re.sub(r"(allprojects\s*\{\s*repositories\s*\{)",
+                    r'\1\n        maven { url = uri("${rootDir}/localmaven") }', s2, count=1)
+    open(g, "w").write(s2)
+    print(s2)
+
 # --- MainActivity ---
 mas = glob.glob("android/app/src/main/**/MainActivity.kt", recursive=True)
 if not mas:

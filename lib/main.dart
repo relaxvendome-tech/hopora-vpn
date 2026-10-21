@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'l10n.dart';
+import 'tor_page.dart';
 
 const privacyUrl =
     'https://docs.google.com/document/d/1tQjFS1UTiuDBasafS3ISdxoqun_xpiiz7NTTHG_L2Dc/view';
@@ -23,6 +24,9 @@ const privacyUrl =
 const maxSessionSeconds = 4 * 3600;
 
 late SharedPreferences prefs;
+
+/// Coupe le VPN du mode Rapide (renseigne par l'ecran Rapide).
+VoidCallback? stopFastVpn;
 const _secureChannel = MethodChannel('hopora/secure');
 
 Future<void> main() async {
@@ -36,8 +40,22 @@ Future<void> main() async {
         'ics-openvpn: https://github.com/schwabe/ics-openvpn\n'
         'openvpn_library: https://github.com/nizwar/openvpn_library',
       )));
+  LicenseRegistry.addLicense(() => Stream.value(const LicenseEntryWithLineBreaks(
+        ['Tor', 'tor-android', 'jtorctl'],
+        'BSD 3-Clause License. The Tor Project, Inc. and The Guardian Project.\n'
+        'https://gitlab.torproject.org/tpo/core/tor\n'
+        'https://github.com/guardianproject/tor-android',
+      )));
+  LicenseRegistry.addLicense(() => Stream.value(const LicenseEntryWithLineBreaks(
+        ['IPtProxy', 'Snowflake', 'Lyrebird (obfs4, meek)'],
+        'MIT / BSD licenses. https://github.com/tladesignz/IPtProxy\n'
+        'Snowflake and Lyrebird: The Tor Project.',
+      )));
+  LicenseRegistry.addLicense(() => Stream.value(const LicenseEntryWithLineBreaks(
+        ['hev-socks5-tunnel'],
+        'MIT License. Copyright (c) hev. https://github.com/heiher/hev-socks5-tunnel',
+      )));
   runApp(const HoporaApp());
-  AdsManager.init();
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +157,7 @@ class HoporaApp extends StatelessWidget {
             ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark),
         useMaterial3: true,
       ),
-      home: const ServerListPage(),
+      home: const HomeShell(),
     );
   }
 }
@@ -543,6 +561,10 @@ class _ServerListPageState extends State<ServerListPage>
       },
       lastStatus: _onVpnStatus,
     );
+    AdsManager.init();
+    stopFastVpn = () {
+      if (_isConnected || _isBusy) _disconnect();
+    };
     _loadHistory();
     _load();
   }
@@ -814,6 +836,9 @@ class _ServerListPageState extends State<ServerListPage>
       if (ok != true) return;
       await prefs.setBool('vpn_consent', true);
     }
+    // Un seul VPN a la fois : le mode Tor est coupe avant.
+    await TorCtl.stopIfRunning();
+    if (!mounted) return;
     // IP de reference prise avant de se connecter (hors VPN).
     final before =
         (_isConnected || _isBusy) ? _ipBefore : await VpnGateApi.currentIp() ?? _myIp;
@@ -846,68 +871,12 @@ class _ServerListPageState extends State<ServerListPage>
     });
   }
 
-  void _showRiskInfo() {
-    Widget link(IconData icon, String key, String url) => ListTile(
-          contentPadding: EdgeInsets.zero,
-          leading: Icon(icon),
-          title: Text(L.t(key)),
-          trailing: const Icon(Icons.open_in_new, size: 18),
-          onTap: () => launchUrl(Uri.parse(url),
-              mode: LaunchMode.externalApplication),
-        );
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.warning_amber_rounded, color: Colors.orange),
-        title: Text(L.t('risk_title')),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(L.t('risk_body')),
-              const SizedBox(height: 8),
-              link(Icons.travel_explore, 'risk_tor',
-                  'https://www.torproject.org/download/'),
-              link(Icons.chat_outlined, 'risk_signal', 'https://signal.org/'),
-              link(Icons.support_agent, 'risk_help',
-                  'https://www.accessnow.org/help/'),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _openKillSwitch() async {
-    final go = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.shield_outlined),
-        title: Text(L.t('p_killswitch')),
-        content: Text(L.t('killswitch_help')),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: Text(L.t('cancel'))),
-          FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: Text(L.t('enable'))),
-        ],
-      ),
-    );
-    if (go == true) {
-      try {
-        await _secureChannel.invokeMethod('vpnSettings');
-      } catch (_) {}
-    }
-  }
+  void _showRiskInfo() => showRiskInfo(context);
+  Future<void> _openKillSwitch() => openKillSwitch(context);
+  void _openSettings() =>
+      openAppSettings(context, onChanged: () {
+        if (mounted) setState(() {});
+      });
 
   Future<bool?> _showConsent() {
     return showDialog<bool>(
@@ -1096,77 +1065,6 @@ class _ServerListPageState extends State<ServerListPage>
 
   // ----- Interface -----
 
-  void _openSettings() {
-    showModalBottomSheet(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheet) {
-          final discreet = prefs.getBool('discreet') ?? true;
-          return SafeArea(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                SwitchListTile(
-                  secondary: const Icon(Icons.visibility_off_outlined),
-                  title: Text(L.t('discreet_mode')),
-                  subtitle: Text(L.t('discreet_desc')),
-                  value: discreet,
-                  onChanged: (v) async {
-                    await prefs.setBool('discreet', v);
-                    try {
-                      await _secureChannel.invokeMethod('set', v);
-                    } catch (_) {}
-                    setSheet(() {});
-                    if (mounted) setState(() {});
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.shield_outlined),
-                  title: Text(L.t('p_killswitch')),
-                  subtitle: Text(L.t('p_killswitch_desc')),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _openKillSwitch();
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.warning_amber_rounded,
-                      color: Colors.orange),
-                  title: Text(L.t('risk_title')),
-                  subtitle: Text(L.t('risk_sub')),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _showRiskInfo();
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.policy_outlined),
-                  title: Text(L.t('privacy')),
-                  onTap: () => launchUrl(Uri.parse(privacyUrl),
-                      mode: LaunchMode.externalApplication),
-                ),
-                ListTile(
-                  leading: const Icon(Icons.code),
-                  title: Text(L.t('licenses')),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    showLicensePage(
-                      context: context,
-                      applicationName: 'Hopora VPN',
-                      applicationLegalese: L.t('legalese'),
-                    );
-                  },
-                ),
-                const SizedBox(height: 8),
-              ],
-            ),
-          );
-        },
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final shown = _shown;
@@ -1298,6 +1196,145 @@ class _ServerListPageState extends State<ServerListPage>
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// Reglages et informations partages (modes Rapide et Tor)
+// ---------------------------------------------------------------------------
+
+void showRiskInfo(BuildContext context) {
+  Widget link(IconData icon, String key, String url) => ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(icon),
+        title: Text(L.t(key)),
+        trailing: const Icon(Icons.open_in_new, size: 18),
+        onTap: () => launchUrl(Uri.parse(url),
+            mode: LaunchMode.externalApplication),
+      );
+  showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      icon: const Icon(Icons.warning_amber_rounded, color: Colors.orange),
+      title: Text(L.t('risk_title')),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(L.t('risk_body')),
+            const SizedBox(height: 8),
+            link(Icons.travel_explore, 'risk_tor',
+                'https://www.torproject.org/download/'),
+            link(Icons.chat_outlined, 'risk_signal', 'https://signal.org/'),
+            link(Icons.support_agent, 'risk_help',
+                'https://www.accessnow.org/help/'),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('OK'),
+        ),
+      ],
+    ),
+  );
+}
+
+Future<void> openKillSwitch(BuildContext context) async {
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      icon: const Icon(Icons.shield_outlined),
+      title: Text(L.t('p_killswitch')),
+      content: Text(L.t('killswitch_help')),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(L.t('cancel'))),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(L.t('enable'))),
+      ],
+    ),
+  );
+  if (go == true) {
+    try {
+      await _secureChannel.invokeMethod('vpnSettings');
+    } catch (_) {}
+  }
+}
+
+void openAppSettings(BuildContext context, {VoidCallback? onChanged}) {
+  showModalBottomSheet(
+    context: context,
+    showDragHandle: true,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setSheet) {
+        final discreet = prefs.getBool('discreet') ?? true;
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SwitchListTile(
+                secondary: const Icon(Icons.visibility_off_outlined),
+                title: Text(L.t('discreet_mode')),
+                subtitle: Text(L.t('discreet_desc')),
+                value: discreet,
+                onChanged: (v) async {
+                  await prefs.setBool('discreet', v);
+                  try {
+                    await _secureChannel.invokeMethod('set', v);
+                  } catch (_) {}
+                  setSheet(() {});
+                  onChanged?.call();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.shield_outlined),
+                title: Text(L.t('p_killswitch')),
+                subtitle: Text(L.t('p_killswitch_desc')),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  openKillSwitch(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.warning_amber_rounded,
+                    color: Colors.orange),
+                title: Text(L.t('risk_title')),
+                subtitle: Text(L.t('risk_sub')),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showRiskInfo(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.policy_outlined),
+                title: Text(L.t('privacy')),
+                onTap: () => launchUrl(Uri.parse(privacyUrl),
+                    mode: LaunchMode.externalApplication),
+              ),
+              ListTile(
+                leading: const Icon(Icons.code),
+                title: Text(L.t('licenses')),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  showLicensePage(
+                    context: context,
+                    applicationName: 'Hopora VPN',
+                    applicationLegalese: L.t('legalese'),
+                  );
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    ),
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // Widgets
