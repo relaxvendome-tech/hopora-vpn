@@ -254,17 +254,66 @@ class VpnGateApi {
     return out;
   }
 
-  static Future<String?> currentIp() async {
+  /// IP publique actuelle + pays (ipwho.is), repli sur ipify (IP seule).
+  static Future<IpInfo?> currentIp() async {
+    final nonce = DateTime.now().millisecondsSinceEpoch;
     try {
       final res = await http
-          .get(Uri.parse('https://api.ipify.org?format=json'))
+          .get(Uri.parse('https://ipwho.is/?lang=fr&_=$nonce'),
+              headers: {'Cache-Control': 'no-cache'})
           .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return (jsonDecode(res.body) as Map<String, dynamic>)['ip'] as String?;
+        final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+        if (j['success'] != false && j['ip'] != null) {
+          final conn = j['connection'];
+          return IpInfo(
+            ip: j['ip'] as String,
+            country: (j['country'] ?? '') as String,
+            countryCode: (j['country_code'] ?? '') as String,
+            city: (j['city'] ?? '') as String,
+            isp: conn is Map ? (conn['isp'] ?? '').toString() : '',
+          );
+        }
+      }
+    } catch (_) {}
+    try {
+      final res = await http
+          .get(Uri.parse('https://api.ipify.org?format=json&_=$nonce'))
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        final ip =
+            (jsonDecode(res.body) as Map<String, dynamic>)['ip'] as String?;
+        if (ip != null) return IpInfo(ip: ip);
       }
     } catch (_) {}
     return null;
   }
+}
+
+class IpInfo {
+  final String ip;
+  final String country;
+  final String countryCode;
+  final String city;
+  final String isp;
+  const IpInfo({
+    required this.ip,
+    this.country = '',
+    this.countryCode = '',
+    this.city = '',
+    this.isp = '',
+  });
+
+  String get place {
+    final parts = [city, country].where((s) => s.isNotEmpty).toList();
+    return parts.join(', ');
+  }
+}
+
+String flagOf(String cc) {
+  final c = cc.toUpperCase();
+  if (c.length != 2 || c.codeUnits.any((u) => u < 65 || u > 90)) return '🌐';
+  return String.fromCharCodes(c.codeUnits.map((u) => 0x1F1E6 + u - 65).toList());
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +329,8 @@ class ServerListPage extends StatefulWidget {
   State<ServerListPage> createState() => _ServerListPageState();
 }
 
-class _ServerListPageState extends State<ServerListPage> {
+class _ServerListPageState extends State<ServerListPage>
+    with WidgetsBindingObserver {
   static const maxShown = 50;
 
   List<VpnServer> _all = [];
@@ -288,13 +338,45 @@ class _ServerListPageState extends State<ServerListPage> {
   String? _error;
   String? _country; // null = tous
   SortMode _sort = SortMode.score;
-  String? _myIp;
+  IpInfo? _myIp;
+  bool _ipChecking = false;
+  bool _ipFailed = false;
   bool _showWarning = true;
+
+  // Pour la verification : IP avant connexion + serveur choisi.
+  IpInfo? _ipBefore;
+  VpnServer? _target;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // Au retour d'OpenVPN, on reverifie l'IP automatiquement.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _target != null) {
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted) _refreshIp();
+      });
+    }
+  }
+
+  Future<void> _beforeConnect(VpnServer s) async {
+    final current = await VpnGateApi.currentIp() ?? _myIp;
+    if (!mounted) return;
+    setState(() {
+      _ipBefore = current;
+      _target = s;
+    });
   }
 
   Future<void> _load() async {
@@ -315,14 +397,21 @@ class _ServerListPageState extends State<ServerListPage> {
     if (!mounted) return;
     setState(() {
       _myIp = ip;
+      _ipFailed = ip == null;
       _loading = false;
     });
   }
 
   Future<void> _refreshIp() async {
-    setState(() => _myIp = null);
+    if (_ipChecking) return;
+    setState(() => _ipChecking = true);
     final ip = await VpnGateApi.currentIp();
-    if (mounted) setState(() => _myIp = ip ?? 'inconnue');
+    if (!mounted) return;
+    setState(() {
+      _ipChecking = false;
+      _ipFailed = ip == null;
+      if (ip != null) _myIp = ip;
+    });
   }
 
   List<VpnServer> get _shown {
@@ -388,7 +477,14 @@ class _ServerListPageState extends State<ServerListPage> {
                   child: ListView(
                     padding: const EdgeInsets.only(bottom: 24),
                     children: [
-                      _IpCard(ip: _myIp, onRefresh: _refreshIp),
+                      _IpCard(
+                        ip: _myIp,
+                        before: _ipBefore,
+                        target: _target,
+                        checking: _ipChecking || (_loading && _myIp == null),
+                        failed: _ipFailed,
+                        onRefresh: _refreshIp,
+                      ),
                       if (_showWarning)
                         _WarningCard(
                             onClose: () => setState(() => _showWarning = false)),
@@ -417,7 +513,7 @@ class _ServerListPageState extends State<ServerListPage> {
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
-      builder: (_) => _ConnectSheet(server: s),
+      builder: (_) => _ConnectSheet(server: s, onBeforeConnect: _beforeConnect),
     );
   }
 }
@@ -426,31 +522,186 @@ class _ServerListPageState extends State<ServerListPage> {
 // Widgets
 // ---------------------------------------------------------------------------
 
+enum IpStatus { unknown, changed, viaServer, unchanged }
+
 class _IpCard extends StatelessWidget {
-  final String? ip;
+  final IpInfo? ip;
+  final IpInfo? before;
+  final VpnServer? target;
+  final bool checking;
+  final bool failed;
   final VoidCallback onRefresh;
-  const _IpCard({required this.ip, required this.onRefresh});
+  const _IpCard({
+    required this.ip,
+    required this.before,
+    required this.target,
+    required this.checking,
+    required this.failed,
+    required this.onRefresh,
+  });
+
+  IpStatus get status {
+    final now = ip;
+    final b = before;
+    if (now == null || b == null || target == null) return IpStatus.unknown;
+    if (now.ip == target!.ip) return IpStatus.viaServer;
+    if (now.ip != b.ip) return IpStatus.changed;
+    return IpStatus.unchanged;
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+    const ok = Color(0xFF1E8E3E);
+    const warn = Color(0xFFE37400);
+
+    final st = status;
+    final (Color bg, Color fg, IconData icon, String headline) = switch (st) {
+      IpStatus.viaServer => (
+          ok.withValues(alpha: 0.16),
+          cs.onSurface,
+          Icons.verified_user,
+          'IP changée : vous passez par le serveur ${target!.country}'
+        ),
+      IpStatus.changed => (
+          ok.withValues(alpha: 0.16),
+          cs.onSurface,
+          Icons.check_circle,
+          'IP changée'
+        ),
+      IpStatus.unchanged => (
+          warn.withValues(alpha: 0.16),
+          cs.onSurface,
+          Icons.warning_amber_rounded,
+          'IP inchangée : le VPN n\'est pas encore actif'
+        ),
+      IpStatus.unknown => (
+          cs.primaryContainer,
+          cs.onPrimaryContainer,
+          Icons.public,
+          'Votre IP actuelle'
+        ),
+    };
+    final iconColor = switch (st) {
+      IpStatus.viaServer || IpStatus.changed => ok,
+      IpStatus.unchanged => warn,
+      IpStatus.unknown => cs.onPrimaryContainer,
+    };
+
+    final now = ip;
     return Card(
       margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-      color: cs.primaryContainer,
-      child: ListTile(
-        leading: Icon(Icons.public, color: cs.onPrimaryContainer),
-        title: Text('Votre IP actuelle',
-            style: TextStyle(color: cs.onPrimaryContainer)),
-        subtitle: Text(ip ?? 'Recherche…',
-            style: TextStyle(
-                color: cs.onPrimaryContainer,
-                fontWeight: FontWeight.w600,
-                fontSize: 16)),
-        trailing: IconButton(
-          tooltip: 'Vérifier mon IP',
-          icon: Icon(Icons.refresh, color: cs.onPrimaryContainer),
-          onPressed: onRefresh,
+      color: bg,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 8, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Icon(icon, color: iconColor),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(headline,
+                      style: tt.titleMedium
+                          ?.copyWith(color: fg, fontWeight: FontWeight.w600)),
+                ),
+                checking
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2)),
+                      )
+                    : IconButton(
+                        tooltip: 'Vérifier mon IP',
+                        icon: Icon(Icons.refresh, color: fg),
+                        onPressed: onRefresh,
+                      ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.only(left: 36, right: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (now == null)
+                    Text(failed ? 'Impossible de vérifier l\'IP pour le moment.' : 'Recherche…',
+                        style: TextStyle(color: fg))
+                  else ...[
+                    if (before != null && st != IpStatus.unknown)
+                      _IpLine(label: 'Avant', info: before!, color: fg, strike: st != IpStatus.unchanged),
+                    _IpLine(
+                        label: before != null && st != IpStatus.unknown ? 'Maintenant' : 'IP',
+                        info: now,
+                        color: fg,
+                        bold: true),
+                  ],
+                  if (st == IpStatus.unchanged) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'Ouvrez OpenVPN for Android, touchez le profil Hopora pour l\'activer, '
+                      'puis revenez ici : l\'IP est revérifiée automatiquement.',
+                      style: tt.bodySmall?.copyWith(color: fg),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
         ),
+      ),
+    );
+  }
+}
+
+class _IpLine extends StatelessWidget {
+  final String label;
+  final IpInfo info;
+  final Color color;
+  final bool bold;
+  final bool strike;
+  const _IpLine({
+    required this.label,
+    required this.info,
+    required this.color,
+    this.bold = false,
+    this.strike = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final place = info.place;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 92,
+            child: Text(label,
+                style: TextStyle(color: color.withValues(alpha: 0.75))),
+          ),
+          Expanded(
+            child: Text(
+              '${info.countryCode.isNotEmpty ? '${flagOf(info.countryCode)} ' : ''}'
+              '${info.ip}${place.isNotEmpty ? '  ·  $place' : ''}',
+              style: TextStyle(
+                color: color,
+                fontWeight: bold ? FontWeight.w600 : FontWeight.normal,
+                decoration: strike ? TextDecoration.lineThrough : null,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -571,7 +822,8 @@ class _ServerTile extends StatelessWidget {
 
 class _ConnectSheet extends StatefulWidget {
   final VpnServer server;
-  const _ConnectSheet({required this.server});
+  final Future<void> Function(VpnServer) onBeforeConnect;
+  const _ConnectSheet({required this.server, required this.onBeforeConnect});
 
   @override
   State<_ConnectSheet> createState() => _ConnectSheetState();
@@ -586,6 +838,7 @@ class _ConnectSheetState extends State<_ConnectSheet> {
       _busy = true;
       _status = null;
     });
+    await widget.onBeforeConnect(widget.server);
     await AdsManager.showThen(_openProfile);
   }
 
@@ -665,7 +918,7 @@ class _ConnectSheetState extends State<_ConnectSheet> {
             Text(
               '1. Appuyez sur « Se connecter » : le serveur s\'ouvre dans OpenVPN for Android.\n'
               '2. Validez l\'import (coche en haut à droite).\n'
-              '3. Touchez le profil pour vous connecter, puis revenez vérifier votre IP.',
+              '3. Touchez le profil pour vous connecter, puis revenez dans Hopora : votre IP est vérifiée automatiquement.',
               style: tt.bodyMedium,
             ),
             const SizedBox(height: 16),
