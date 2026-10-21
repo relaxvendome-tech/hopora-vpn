@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -845,6 +846,45 @@ class _ServerListPageState extends State<ServerListPage>
     });
   }
 
+  void _showRiskInfo() {
+    Widget link(IconData icon, String key, String url) => ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(icon),
+          title: Text(L.t(key)),
+          trailing: const Icon(Icons.open_in_new, size: 18),
+          onTap: () => launchUrl(Uri.parse(url),
+              mode: LaunchMode.externalApplication),
+        );
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.warning_amber_rounded, color: Colors.orange),
+        title: Text(L.t('risk_title')),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(L.t('risk_body')),
+              const SizedBox(height: 8),
+              link(Icons.travel_explore, 'risk_tor',
+                  'https://www.torproject.org/download/'),
+              link(Icons.chat_outlined, 'risk_signal', 'https://signal.org/'),
+              link(Icons.support_agent, 'risk_help',
+                  'https://www.accessnow.org/help/'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _openKillSwitch() async {
     final go = await showDialog<bool>(
       context: context,
@@ -1088,6 +1128,16 @@ class _ServerListPageState extends State<ServerListPage>
                   onTap: () {
                     Navigator.pop(ctx);
                     _openKillSwitch();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.warning_amber_rounded,
+                      color: Colors.orange),
+                  title: Text(L.t('risk_title')),
+                  subtitle: Text(L.t('risk_sub')),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _showRiskInfo();
                   },
                 ),
                 ListTile(
