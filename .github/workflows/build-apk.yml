@@ -46,8 +46,10 @@ jobs:
 
       - name: Configurer Android (VPN, discretion, AdMob, icone)
         run: |
-          python3 android_templates/patch_android.py
+          # Icones d'abord : l'outil reecrit les attributs android:icon du manifeste.
           dart run flutter_launcher_icons
+          python3 android_templates/patch_android.py
+          grep -n "ic_calc\|LauncherCalc" android/app/src/main/AndroidManifest.xml
           grep -n minSdk android/app/build.gradle* || true
 
       - name: Construire
