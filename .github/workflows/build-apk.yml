@@ -56,6 +56,7 @@ jobs:
           UNIT="${ADMOB_INTERSTITIAL_ID:-ca-app-pub-3940256099942544/1033173712}"
           set -o pipefail
           flutter build apk --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee build.log
+          flutter build appbundle --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee -a build.log
 
       - name: Remonter les erreurs
         if: failure()
@@ -72,10 +73,11 @@ jobs:
       - name: Deposer l'APK dans la branche hopora-apk
         run: |
           mkdir -p /tmp/out && cp build/app/outputs/flutter-apk/app-release.apk /tmp/out/HoporaVPN.apk
+          cp build/app/outputs/bundle/release/app-release.aab /tmp/out/HoporaVPN-unsigned.aab
           cd /tmp/out
           git init -q -b hopora-apk
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add HoporaVPN.apk
+          git add HoporaVPN.apk HoporaVPN-unsigned.aab
           git commit -q -m "APK Hopora VPN ${GITHUB_SHA::7}"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" hopora-apk
