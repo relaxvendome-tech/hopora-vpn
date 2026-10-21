@@ -128,7 +128,7 @@ class VpnServer {
   final String operator;
   final String configB64;
 
-  const VpnServer({
+  VpnServer({
     required this.host,
     required this.ip,
     required this.score,
@@ -144,6 +144,23 @@ class VpnServer {
 
   double get speedMbps => speed / 1000000;
 
+  /// Adresse, port et protocole du serveur OpenVPN (ligne "remote").
+  late final (String, int, bool)? remote = () {
+    try {
+      final cfg = rawConfig;
+      final proto = RegExp(r'^\s*proto\s+(\w+)', multiLine: true)
+              .firstMatch(cfg)
+              ?.group(1) ??
+          'udp';
+      final m = RegExp(r'^\s*remote\s+(\S+)\s+(\d+)', multiLine: true)
+          .firstMatch(cfg);
+      if (m == null) return null;
+      return (m.group(1)!, int.parse(m.group(2)!), proto.startsWith('tcp'));
+    } catch (_) {
+      return null;
+    }
+  }();
+
   String get flag {
     final cc = countryCode.toUpperCase();
     if (cc.length != 2 ||
@@ -154,8 +171,25 @@ class VpnServer {
         cc.codeUnits.map((c) => 0x1F1E6 + c - 65).toList());
   }
 
-  String get rawConfig =>
+  late final String rawConfig =
       utf8.decode(base64.decode(configB64), allowMalformed: true);
+
+  /// Mesure le temps de connexion TCP depuis l'appareil (ms).
+  /// null = non mesurable (UDP), -1 = injoignable.
+  Future<int?> measureLatency() async {
+    final r = remote;
+    if (r == null || !r.$3) return null;
+    final sw = Stopwatch()..start();
+    try {
+      final sock = await Socket.connect(r.$1, r.$2,
+          timeout: const Duration(milliseconds: 1800));
+      sw.stop();
+      sock.destroy();
+      return sw.elapsedMilliseconds;
+    } catch (_) {
+      return -1;
+    }
+  }
 
   /// Chiffrement d'origine annonce par le serveur (ex. AES-128-CBC).
   String get serverCipher {
@@ -181,7 +215,6 @@ class VpnServer {
         .where((l) => !l.trimLeft().startsWith('data-ciphers'))
         .toList();
     return [
-      '# Hopora VPN - chiffrement renforce',
       'data-ciphers ${ciphers.join(':')}',
       ...lines,
     ].join('\n');
@@ -320,7 +353,7 @@ String flagOf(String cc) {
 // Ecran principal
 // ---------------------------------------------------------------------------
 
-enum SortMode { score, speed, ping }
+enum SortMode { best, score, speed, ping }
 
 class ServerListPage extends StatefulWidget {
   const ServerListPage({super.key});
@@ -337,11 +370,17 @@ class _ServerListPageState extends State<ServerListPage>
   bool _loading = true;
   String? _error;
   String? _country; // null = tous
-  SortMode _sort = SortMode.score;
+  SortMode _sort = SortMode.best;
   IpInfo? _myIp;
   bool _ipChecking = false;
   bool _ipFailed = false;
   bool _showWarning = true;
+  bool _revealIp = false; // mode discret : IP masquee par defaut
+
+  // Ping mesure depuis l'appareil : ip -> ms (-1 = injoignable).
+  final Map<String, int> _latency = {};
+  bool _measuring = false;
+  int _measureRun = 0;
 
   // Pour la verification : IP avant connexion + serveur choisi.
   IpInfo? _ipBefore;
@@ -351,6 +390,7 @@ class _ServerListPageState extends State<ServerListPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _cleanProfiles(Duration.zero);
     _load();
   }
 
@@ -360,14 +400,32 @@ class _ServerListPageState extends State<ServerListPage>
     super.dispose();
   }
 
-  // Au retour d'OpenVPN, on reverifie l'IP automatiquement.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _target != null) {
-      Future.delayed(const Duration(seconds: 2), () {
-        if (mounted) _refreshIp();
-      });
+    if (state == AppLifecycleState.resumed) {
+      // Discretion : on efface les profils deja transmis a OpenVPN.
+      _cleanProfiles(const Duration(minutes: 1));
+      // Au retour d'OpenVPN, on reverifie l'IP automatiquement.
+      if (_target != null) {
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted) _refreshIp();
+        });
+      }
     }
+  }
+
+  /// Supprime les fichiers de profil temporaires (aucune trace sur l'appareil).
+  Future<void> _cleanProfiles(Duration olderThan) async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final now = DateTime.now();
+      await for (final f in dir.list()) {
+        if (f is File && f.path.endsWith('.ovpn')) {
+          final age = now.difference(await f.lastModified());
+          if (age >= olderThan) await f.delete();
+        }
+      }
+    } catch (_) {}
   }
 
   Future<void> _beforeConnect(VpnServer s) async {
@@ -388,7 +446,11 @@ class _ServerListPageState extends State<ServerListPage>
     try {
       final servers = await VpnGateApi.fetchServers();
       if (!mounted) return;
-      setState(() => _all = servers);
+      setState(() {
+        _all = servers;
+        _latency.clear();
+      });
+      _measureFastest();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
@@ -400,6 +462,55 @@ class _ServerListPageState extends State<ServerListPage>
       _ipFailed = ip == null;
       _loading = false;
     });
+  }
+
+  /// Mesure le ping reel (depuis le telephone) des 40 serveurs les plus
+  /// rapides, par paquets de 10, pour trouver le meilleur pour l'utilisateur.
+  Future<void> _measureFastest() async {
+    final run = ++_measureRun;
+    final candidates = [..._all.where((s) => s.remote?.$3 == true)]
+      ..sort((a, b) => b.speed.compareTo(a.speed));
+    final top = candidates.take(40).toList();
+    setState(() => _measuring = true);
+    for (var i = 0; i < top.length; i += 10) {
+      final batch = top.skip(i).take(10).toList();
+      final results = await Future.wait(batch.map((s) => s.measureLatency()));
+      if (!mounted || run != _measureRun) return;
+      setState(() {
+        for (var j = 0; j < batch.length; j++) {
+          final r = results[j];
+          if (r != null) _latency[batch[j].ip] = r;
+        }
+      });
+    }
+    if (mounted && run == _measureRun) setState(() => _measuring = false);
+  }
+
+  /// Note de rapidite : debit divise par la latence (mesuree si possible).
+  double _quality(VpnServer s) {
+    final l = _latency[s.ip];
+    if (l == -1) return -1; // injoignable depuis cet appareil
+    final ping = (l != null && l > 0)
+        ? l.toDouble()
+        : (s.ping > 0 ? s.ping + 150.0 : 400.0); // non mesure : penalise
+    return s.speedMbps / (1 + ping / 40);
+  }
+
+  List<VpnServer> get _filtered => _all
+      .where((s) => _country == null || s.countryCode == _country)
+      .toList();
+
+  VpnServer? get _fastest {
+    VpnServer? best;
+    var bestQ = -1.0;
+    for (final s in _filtered) {
+      final q = _quality(s);
+      if (q > bestQ) {
+        bestQ = q;
+        best = s;
+      }
+    }
+    return bestQ > 0 ? best : null;
   }
 
   Future<void> _refreshIp() async {
@@ -415,20 +526,22 @@ class _ServerListPageState extends State<ServerListPage>
   }
 
   List<VpnServer> get _shown {
-    final list = _all
-        .where((s) => _country == null || s.countryCode == _country)
-        .toList();
+    final list = _filtered;
     switch (_sort) {
+      case SortMode.best:
+        list.sort((a, b) => _quality(b).compareTo(_quality(a)));
       case SortMode.score:
         list.sort((a, b) => b.score.compareTo(a.score));
       case SortMode.speed:
         list.sort((a, b) => b.speed.compareTo(a.speed));
       case SortMode.ping:
-        list.sort((a, b) {
-          final pa = a.ping <= 0 ? 9999 : a.ping;
-          final pb = b.ping <= 0 ? 9999 : b.ping;
-          return pa.compareTo(pb);
-        });
+        int p(VpnServer s) {
+          final l = _latency[s.ip];
+          if (l != null && l > 0) return l;
+          if (l == -1) return 99999;
+          return s.ping > 0 ? s.ping + 150 : 9999;
+        }
+        list.sort((a, b) => p(a).compareTo(p(b)));
     }
     return list.take(maxShown).toList();
   }
@@ -443,9 +556,68 @@ class _ServerListPageState extends State<ServerListPage>
     return entries;
   }
 
+  // -------------------------------------------------------------------------
+  // Connexion : pub -> profil renforce -> OpenVPN for Android
+  // -------------------------------------------------------------------------
+
+  Future<void> _connectTo(VpnServer s) async {
+    await _beforeConnect(s);
+    await AdsManager.showThen(() => _openProfile(s));
+  }
+
+  Future<void> _openProfile(VpnServer s) async {
+    try {
+      final dir = await getTemporaryDirectory();
+      // Nom neutre : rien ne revele l'appli ni le serveur.
+      final id = s.ip.hashCode.abs().toRadixString(36);
+      final file = File('${dir.path}/VPN_${s.countryCode}_$id.ovpn');
+      await file.writeAsString(s.hardenedConfig, flush: true);
+      final result = await OpenFilex.open(
+        file.path,
+        type: 'application/x-openvpn-profile',
+      );
+      if (!mounted) return;
+      if (result.type == ResultType.noAppToOpen) {
+        _showMissingOpenVpn();
+      } else if (result.type != ResultType.done) {
+        _snack('Impossible d\'ouvrir le profil : ${result.message}');
+      }
+    } catch (e) {
+      if (mounted) _snack('Impossible d\'ouvrir le profil : $e');
+    }
+  }
+
+  void _snack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  void _showMissingOpenVpn() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Une dernière étape'),
+        content: const Text(
+            'L\'appli gratuite « OpenVPN for Android » établit la connexion chiffrée. '
+            'Installez-la, puis touchez à nouveau « Connexion rapide ».'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Plus tard')),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              installOpenVpn();
+            },
+            child: const Text('Installer OpenVPN'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final shown = _shown;
+    final fastest = _fastest;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Hopora VPN'),
@@ -456,9 +628,10 @@ class _ServerListPageState extends State<ServerListPage>
             initialValue: _sort,
             onSelected: (m) => setState(() => _sort = m),
             itemBuilder: (_) => const [
-              PopupMenuItem(value: SortMode.score, child: Text('Meilleur score')),
-              PopupMenuItem(value: SortMode.speed, child: Text('Plus rapides')),
+              PopupMenuItem(value: SortMode.best, child: Text('Les plus rapides pour vous')),
+              PopupMenuItem(value: SortMode.speed, child: Text('Plus gros débit')),
               PopupMenuItem(value: SortMode.ping, child: Text('Ping le plus bas')),
+              PopupMenuItem(value: SortMode.score, child: Text('Score VPN Gate')),
             ],
           ),
           IconButton(
@@ -477,12 +650,20 @@ class _ServerListPageState extends State<ServerListPage>
                   child: ListView(
                     padding: const EdgeInsets.only(bottom: 24),
                     children: [
+                      _QuickConnectCard(
+                        server: fastest,
+                        latency: fastest == null ? null : _latency[fastest.ip],
+                        measuring: _measuring,
+                        onConnect: fastest == null ? null : () => _connectTo(fastest),
+                      ),
                       _IpCard(
                         ip: _myIp,
                         before: _ipBefore,
                         target: _target,
                         checking: _ipChecking || (_loading && _myIp == null),
                         failed: _ipFailed,
+                        masked: !_revealIp,
+                        onToggleMask: () => setState(() => _revealIp = !_revealIp),
                         onRefresh: _refreshIp,
                       ),
                       if (_showWarning)
@@ -496,12 +677,18 @@ class _ServerListPageState extends State<ServerListPage>
                       Padding(
                         padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
                         child: Text(
-                          '${shown.length} serveurs (IP différentes) · ${_all.length} disponibles',
+                          '${shown.length} serveurs (IP différentes) · ${_all.length} disponibles'
+                          '${_measuring ? ' · mesure du ping…' : ''}',
                           style: Theme.of(context).textTheme.labelLarge,
                         ),
                       ),
                       for (final s in shown)
-                        _ServerTile(server: s, onTap: () => _openSheet(s)),
+                        _ServerTile(
+                          server: s,
+                          latency: _latency[s.ip],
+                          isFastest: identical(s, fastest),
+                          onTap: () => _openSheet(s),
+                        ),
                     ],
                   ),
                 ),
@@ -513,8 +700,27 @@ class _ServerListPageState extends State<ServerListPage>
       context: context,
       showDragHandle: true,
       isScrollControlled: true,
-      builder: (_) => _ConnectSheet(server: s, onBeforeConnect: _beforeConnect),
+      builder: (ctx) => _ConnectSheet(
+        server: s,
+        latency: _latency[s.ip],
+        onConnect: () {
+          Navigator.pop(ctx);
+          _connectTo(s);
+        },
+      ),
     );
+  }
+}
+
+Future<void> installOpenVpn() async {
+  final market = Uri.parse('market://details?id=de.blinkt.openvpn');
+  final web = Uri.parse(
+      'https://play.google.com/store/apps/details?id=de.blinkt.openvpn');
+  try {
+    final ok = await launchUrl(market, mode: LaunchMode.externalApplication);
+    if (!ok) await launchUrl(web, mode: LaunchMode.externalApplication);
+  } catch (_) {
+    await launchUrl(web, mode: LaunchMode.externalApplication);
   }
 }
 
@@ -530,6 +736,8 @@ class _IpCard extends StatelessWidget {
   final VpnServer? target;
   final bool checking;
   final bool failed;
+  final bool masked;
+  final VoidCallback onToggleMask;
   final VoidCallback onRefresh;
   const _IpCard({
     required this.ip,
@@ -537,6 +745,8 @@ class _IpCard extends StatelessWidget {
     required this.target,
     required this.checking,
     required this.failed,
+    required this.masked,
+    required this.onToggleMask,
     required this.onRefresh,
   });
 
@@ -611,6 +821,12 @@ class _IpCard extends StatelessWidget {
                       style: tt.titleMedium
                           ?.copyWith(color: fg, fontWeight: FontWeight.w600)),
                 ),
+                IconButton(
+                  tooltip: masked ? 'Afficher l\'IP' : 'Masquer l\'IP',
+                  icon: Icon(masked ? Icons.visibility_off : Icons.visibility,
+                      color: fg),
+                  onPressed: onToggleMask,
+                ),
                 checking
                     ? const Padding(
                         padding: EdgeInsets.all(12),
@@ -637,17 +853,18 @@ class _IpCard extends StatelessWidget {
                         style: TextStyle(color: fg))
                   else ...[
                     if (before != null && st != IpStatus.unknown)
-                      _IpLine(label: 'Avant', info: before!, color: fg, strike: st != IpStatus.unchanged),
+                      _IpLine(label: 'Avant', info: before!, color: fg, masked: masked, strike: st != IpStatus.unchanged),
                     _IpLine(
                         label: before != null && st != IpStatus.unknown ? 'Maintenant' : 'IP',
                         info: now,
                         color: fg,
+                        masked: masked,
                         bold: true),
                   ],
                   if (st == IpStatus.unchanged) ...[
                     const SizedBox(height: 6),
                     Text(
-                      'Ouvrez OpenVPN for Android, touchez le profil Hopora pour l\'activer, '
+                      'Ouvrez OpenVPN for Android, touchez le profil importé pour l\'activer, '
                       'puis revenez ici : l\'IP est revérifiée automatiquement.',
                       style: tt.bodySmall?.copyWith(color: fg),
                     ),
@@ -668,17 +885,28 @@ class _IpLine extends StatelessWidget {
   final Color color;
   final bool bold;
   final bool strike;
+  final bool masked;
   const _IpLine({
     required this.label,
     required this.info,
     required this.color,
     this.bold = false,
     this.strike = false,
+    this.masked = false,
   });
+
+  /// Mode discret : 83.•••.•••.12 et seulement le pays.
+  static String maskIp(String ip) {
+    final p = ip.split('.');
+    if (p.length == 4) return '${p[0]}.•••.•••.${p[3]}';
+    final v6 = ip.split(':');
+    return v6.length > 2 ? '${v6.first}:•••:${v6.last}' : '•••';
+  }
 
   @override
   Widget build(BuildContext context) {
-    final place = info.place;
+    final place = masked ? info.country : info.place;
+    final shownIp = masked ? maskIp(info.ip) : info.ip;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
@@ -692,7 +920,7 @@ class _IpLine extends StatelessWidget {
           Expanded(
             child: Text(
               '${info.countryCode.isNotEmpty ? '${flagOf(info.countryCode)} ' : ''}'
-              '${info.ip}${place.isNotEmpty ? '  ·  $place' : ''}',
+              '$shownIp${place.isNotEmpty ? '  ·  $place' : ''}',
               style: TextStyle(
                 color: color,
                 fontWeight: bold ? FontWeight.w600 : FontWeight.normal,
@@ -753,19 +981,7 @@ class _CountryChips extends StatelessWidget {
   const _CountryChips(
       {required this.countries, required this.selected, required this.onSelected});
 
-  String _flag(String cc) => VpnServer(
-        host: '',
-        ip: '',
-        score: 0,
-        ping: 0,
-        speed: 0,
-        country: '',
-        countryCode: cc,
-        sessions: 0,
-        uptimeMs: 0,
-        operator: '',
-        configB64: '',
-      ).flag;
+  String _flag(String cc) => flagOf(cc);
 
   @override
   Widget build(BuildContext context) {
@@ -798,91 +1014,141 @@ class _CountryChips extends StatelessWidget {
   }
 }
 
-class _ServerTile extends StatelessWidget {
-  final VpnServer server;
-  final VoidCallback onTap;
-  const _ServerTile({required this.server, required this.onTap});
+String latencyLabel(VpnServer s, int? latency) {
+  if (latency == -1) return 'injoignable';
+  if (latency != null && latency > 0) return '$latency ms';
+  return s.ping > 0 ? '~${s.ping} ms' : '?';
+}
+
+class _QuickConnectCard extends StatelessWidget {
+  final VpnServer? server;
+  final int? latency;
+  final bool measuring;
+  final VoidCallback? onConnect;
+  const _QuickConnectCard({
+    required this.server,
+    required this.latency,
+    required this.measuring,
+    required this.onConnect,
+  });
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
     final s = server;
-    return ListTile(
-      onTap: onTap,
-      leading: Text(s.flag, style: const TextStyle(fontSize: 30)),
-      title: Text('${s.country} · ${s.ip}'),
-      subtitle: Text(
-        '${s.speedMbps.toStringAsFixed(1)} Mb/s · '
-        'ping ${s.ping > 0 ? '${s.ping} ms' : '?'} · '
-        '${s.sessions} connectés',
+    return Card(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      color: cs.primary,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Serveur le plus rapide pour vous',
+                style: tt.labelLarge?.copyWith(color: cs.onPrimary.withValues(alpha: 0.8))),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Text(s?.flag ?? '🌐', style: const TextStyle(fontSize: 32)),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(s?.country ?? 'Recherche…',
+                          style: tt.titleLarge?.copyWith(
+                              color: cs.onPrimary, fontWeight: FontWeight.w600)),
+                      if (s != null)
+                        Text(
+                          '${s.speedMbps.toStringAsFixed(0)} Mb/s · ping ${latencyLabel(s, latency)}',
+                          style: tt.bodyMedium?.copyWith(color: cs.onPrimary),
+                        ),
+                    ],
+                  ),
+                ),
+                if (measuring)
+                  SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: cs.onPrimary),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: cs.onPrimary,
+                foregroundColor: cs.primary,
+                minimumSize: const Size.fromHeight(52),
+                textStyle: tt.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              onPressed: onConnect,
+              icon: const Icon(Icons.bolt),
+              label: const Text('Connexion rapide'),
+            ),
+          ],
+        ),
       ),
-      trailing: const Icon(Icons.chevron_right),
     );
   }
 }
 
-class _ConnectSheet extends StatefulWidget {
+class _ServerTile extends StatelessWidget {
   final VpnServer server;
-  final Future<void> Function(VpnServer) onBeforeConnect;
-  const _ConnectSheet({required this.server, required this.onBeforeConnect});
-
-  @override
-  State<_ConnectSheet> createState() => _ConnectSheetState();
-}
-
-class _ConnectSheetState extends State<_ConnectSheet> {
-  bool _busy = false;
-  String? _status;
-
-  Future<void> _connect() async {
-    setState(() {
-      _busy = true;
-      _status = null;
-    });
-    await widget.onBeforeConnect(widget.server);
-    await AdsManager.showThen(_openProfile);
-  }
-
-  Future<void> _openProfile() async {
-    final s = widget.server;
-    try {
-      final dir = await getTemporaryDirectory();
-      final safeName = s.host.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-      final file =
-          File('${dir.path}/Hopora_${s.countryCode}_$safeName.ovpn');
-      await file.writeAsString(s.hardenedConfig, flush: true);
-      final result = await OpenFilex.open(
-        file.path,
-        type: 'application/x-openvpn-profile',
-      );
-      if (!mounted) return;
-      if (result.type == ResultType.noAppToOpen) {
-        setState(() => _status = 'missing');
-      } else if (result.type != ResultType.done) {
-        setState(() => _status = 'Erreur : ${result.message}');
-      }
-    } catch (e) {
-      if (mounted) setState(() => _status = 'Erreur : $e');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _installOpenVpn() async {
-    final market = Uri.parse('market://details?id=de.blinkt.openvpn');
-    final web = Uri.parse(
-        'https://play.google.com/store/apps/details?id=de.blinkt.openvpn');
-    try {
-      final ok =
-          await launchUrl(market, mode: LaunchMode.externalApplication);
-      if (!ok) await launchUrl(web, mode: LaunchMode.externalApplication);
-    } catch (_) {
-      await launchUrl(web, mode: LaunchMode.externalApplication);
-    }
-  }
+  final int? latency;
+  final bool isFastest;
+  final VoidCallback onTap;
+  const _ServerTile({
+    required this.server,
+    required this.latency,
+    required this.isFastest,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final s = widget.server;
+    final s = server;
+    final cs = Theme.of(context).colorScheme;
+    final dead = latency == -1;
+    return Opacity(
+      opacity: dead ? 0.45 : 1,
+      child: ListTile(
+        onTap: onTap,
+        leading: Text(s.flag, style: const TextStyle(fontSize: 30)),
+        title: Text(s.country),
+        subtitle: Text(
+          '${s.speedMbps.toStringAsFixed(1)} Mb/s · '
+          'ping ${latencyLabel(s, latency)} · '
+          '${s.sessions} connectés',
+        ),
+        trailing: isFastest
+            ? Chip(
+                label: const Text('Le + rapide'),
+                visualDensity: VisualDensity.compact,
+                backgroundColor: cs.primaryContainer,
+                side: BorderSide.none,
+              )
+            : const Icon(Icons.chevron_right),
+      ),
+    );
+  }
+}
+
+class _ConnectSheet extends StatelessWidget {
+  final VpnServer server;
+  final int? latency;
+  final VoidCallback onConnect;
+  const _ConnectSheet({
+    required this.server,
+    required this.latency,
+    required this.onConnect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final s = server;
     final tt = Theme.of(context).textTheme;
     return SafeArea(
       child: Padding(
@@ -900,7 +1166,7 @@ class _ConnectSheetState extends State<_ConnectSheet> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(s.country, style: tt.titleLarge),
-                      SelectableText(s.ip, style: tt.titleMedium),
+                      Text(s.ip, style: tt.titleMedium),
                     ],
                   ),
                 ),
@@ -908,15 +1174,14 @@ class _ConnectSheetState extends State<_ConnectSheet> {
             ),
             const SizedBox(height: 16),
             _Info('Vitesse', '${s.speedMbps.toStringAsFixed(1)} Mb/s'),
-            _Info('Ping', s.ping > 0 ? '${s.ping} ms' : 'inconnu'),
+            _Info('Ping depuis votre appareil', latencyLabel(s, latency)),
             _Info('Chiffrement',
                 'AES-256-GCM prioritaire (repli ${s.serverCipher})'),
             _Info('Utilisateurs connectés', '${s.sessions}'),
             _Info('En ligne depuis', s.uptimeLabel),
-            if (s.operator.isNotEmpty) _Info('Opérateur', s.operator),
             const SizedBox(height: 16),
             Text(
-              '1. Appuyez sur « Se connecter » : le serveur s\'ouvre dans OpenVPN for Android.\n'
+              '1. « Se connecter » ouvre le serveur dans OpenVPN for Android.\n'
               '2. Validez l\'import (coche en haut à droite).\n'
               '3. Touchez le profil pour vous connecter, puis revenez dans Hopora : votre IP est vérifiée automatiquement.',
               style: tt.bodyMedium,
@@ -925,36 +1190,11 @@ class _ConnectSheetState extends State<_ConnectSheet> {
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: _busy ? null : _connect,
-                icon: _busy
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.vpn_lock),
+                onPressed: onConnect,
+                icon: const Icon(Icons.vpn_lock),
                 label: const Text('Se connecter'),
               ),
             ),
-            if (_status == 'missing') ...[
-              const SizedBox(height: 12),
-              Text(
-                'L\'appli gratuite « OpenVPN for Android » est nécessaire pour établir la connexion.',
-                style: tt.bodyMedium,
-              ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: _installOpenVpn,
-                  icon: const Icon(Icons.download),
-                  label: const Text('Installer OpenVPN for Android'),
-                ),
-              ),
-            ] else if (_status != null) ...[
-              const SizedBox(height: 12),
-              Text(_status!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error)),
-            ],
           ],
         ),
       ),

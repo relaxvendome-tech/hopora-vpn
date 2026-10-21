@@ -42,6 +42,29 @@ jobs:
           for G in android/app/build.gradle android/app/build.gradle.kts; do
             [ -f "$G" ] && sed -i -E 's/minSdk(Version)? *=? *flutter\.minSdkVersion/minSdk = 24/' "$G"
           done
+          # Discretion : pas de sauvegarde cloud des donnees de l'appli
+          sed -i 's#android:label="Hopora VPN"#android:label="Hopora VPN" android:allowBackup="false" android:fullBackupContent="false"#' "$M"
+          # Discretion : ecran masque dans les applis recentes et captures bloquees
+          MA=$(find android/app/src/main -name 'MainActivity.kt' | head -1)
+          PKG=$(grep -m1 '^package ' "$MA")
+          cat > "$MA" <<KOT
+          $PKG
+
+          import android.os.Bundle
+          import android.view.WindowManager
+          import io.flutter.embedding.android.FlutterActivity
+
+          class MainActivity : FlutterActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE
+                  )
+              }
+          }
+          KOT
+          cat "$MA"
           cat "$M"
           grep -n minSdk android/app/build.gradle* || true
 
