@@ -216,7 +216,11 @@ class VpnServer {
         .toList();
     return [
       'data-ciphers ${ciphers.join(':')}',
-      ...lines,
+      // Duree maximale de connexion : 24 h, puis deconnexion automatique.
+      // (ignore-unknown-option evite une erreur sur un client trop ancien)
+      'ignore-unknown-option session-timeout',
+      'session-timeout $maxSessionSeconds',
+      ...lines.where((l) => !l.trimLeft().startsWith('session-timeout')),
     ].join('\n');
   }
 
@@ -352,6 +356,9 @@ String flagOf(String cc) {
 // ---------------------------------------------------------------------------
 // Ecran principal
 // ---------------------------------------------------------------------------
+
+/// Duree maximale d'une session VPN gratuite (24 h).
+const maxSessionSeconds = 24 * 3600;
 
 enum SortMode { best, score, speed, ping }
 
@@ -1088,6 +1095,10 @@ class _QuickConnectCard extends StatelessWidget {
               icon: const Icon(Icons.bolt),
               label: const Text('Connexion rapide'),
             ),
+            const SizedBox(height: 8),
+            Text('Session gratuite de 24 h, puis reconnexion en un geste.',
+                textAlign: TextAlign.center,
+                style: tt.bodySmall?.copyWith(color: cs.onPrimary.withValues(alpha: 0.85))),
           ],
         ),
       ),
@@ -1183,7 +1194,8 @@ class _ConnectSheet extends StatelessWidget {
             Text(
               '1. « Se connecter » ouvre le serveur dans OpenVPN for Android.\n'
               '2. Validez l\'import (coche en haut à droite).\n'
-              '3. Touchez le profil pour vous connecter, puis revenez dans Hopora : votre IP est vérifiée automatiquement.',
+              '3. Touchez le profil pour vous connecter, puis revenez dans Hopora : votre IP est vérifiée automatiquement.\n'
+              'La session gratuite dure 24 h maximum, puis se reconnecte depuis Hopora.',
               style: tt.bodyMedium,
             ),
             const SizedBox(height: 16),
