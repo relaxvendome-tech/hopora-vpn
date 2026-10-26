@@ -16,7 +16,7 @@ adb shell appops set $PKG ACTIVATE_VPN allow
 run() {   # $1 = methode (direct, snowflake, obfs4...)
   adb logcat -c
   adb shell am force-stop $PKG
-  adb shell am start -n $PKG/.MainActivity -e hopora_ci "$1" > /dev/null
+  adb shell am start -n $PKG/.LauncherDefault -e hopora_ci "$1" > /dev/null
   local verdict=""
   for _ in $(seq 1 90); do      # 90 x 5 s = 7 min 30 maximum
     verdict=$(adb logcat -d -s HOPORA_CI:I | grep -o "HOPORA_CI_RESULT:.*" | tail -1)
