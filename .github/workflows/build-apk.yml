@@ -48,11 +48,13 @@ jobs:
 
       - name: Configurer Android (VPN, discretion, AdMob, icone)
         run: |
-          # Icones d'abord : l'outil reecrit les attributs android:icon du manifeste.
-          dart run flutter_launcher_icons
-          python3 android_templates/patch_android.py
-          grep -n "ic_calc\|LauncherCalc" android/app/src/main/AndroidManifest.xml
-          grep -n minSdk android/app/build.gradle* || true
+          set -o pipefail
+          {
+            # Icones d'abord : l'outil reecrit les attributs android:icon du manifeste.
+            dart run flutter_launcher_icons
+            python3 android_templates/patch_android.py
+            grep -n "ic_calc\|LauncherCalc" android/app/src/main/AndroidManifest.xml
+          } 2>&1 | tee build.log
 
       - name: Construire
         run: |
@@ -62,7 +64,7 @@ jobs:
           # Taille : un APK par architecture (au lieu d'un APK universel) et code
           # Dart obfusque, symboles de debogage sortis du paquet.
           OPT="--obfuscate --split-debug-info=build/symbols --dart-define=ADMOB_INTERSTITIAL_ID=$UNIT"
-          flutter build apk --release --split-per-abi $OPT 2>&1 | tee build.log
+          flutter build apk --release --split-per-abi $OPT 2>&1 | tee -a build.log
           flutter build appbundle --release $OPT 2>&1 | tee -a build.log
           # Version de test (debuggable, x86_64) : seule elle active le test automatique.
           flutter build apk --debug --target-platform android-x64 --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee -a build.log
