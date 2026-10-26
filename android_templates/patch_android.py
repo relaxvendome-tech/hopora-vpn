@@ -105,17 +105,44 @@ ovpn = [x for x in deps["plugins"]["android"] if x["name"] == "openvpn_flutter"]
 ver = re.search(r"openvpn_library:([^'\"]+)", open(os.path.join(ovpn, "android", "build.gradle")).read()).group(1)
 repo_dir = os.path.abspath("android/localmaven/com/github/nizwar/openvpn_library/" + ver)
 os.makedirs(repo_dir, exist_ok=True)
+import time, shutil
 base = f"https://jitpack.io/com/github/nizwar/openvpn_library/{ver}/openvpn_library-{ver}"
-urllib.request.urlretrieve(base + ".pom", os.path.join(repo_dir, f"openvpn_library-{ver}.pom"))
-raw = os.path.join(repo_dir, "raw.aar")
-urllib.request.urlretrieve(base + ".aar", raw)
-with zipfile.ZipFile(raw) as zin, zipfile.ZipFile(os.path.join(repo_dir, f"openvpn_library-{ver}.aar"), "w", zipfile.ZIP_DEFLATED) as zout:
-    for item in zin.infolist():
-        if item.filename.endswith("libgojni.so"):
-            print("retire", item.filename)
-            continue
-        zout.writestr(item, zin.read(item.filename))
-os.remove(raw)
+vendor = "vendor"   # copie de secours (branche "vendor", recuperee par la CI)
+aar_out = os.path.join(repo_dir, f"openvpn_library-{ver}.aar")
+pom_out = os.path.join(repo_dir, f"openvpn_library-{ver}.pom")
+
+def fetch(url, dest, tries=4):
+    for t in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Gradle/8.14 (Linux;x86_64)"})
+            with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+                shutil.copyfileobj(r, f)
+            return True
+        except Exception as e:
+            print("essai", t + 1, url, e)
+            time.sleep(10 * (t + 1))
+    return False
+
+vaar = os.path.join(vendor, os.path.basename(aar_out))
+vpom = os.path.join(vendor, os.path.basename(pom_out))
+if os.path.exists(vaar) and os.path.exists(vpom):
+    print("openvpn_library : copie de secours utilisee")
+    shutil.copy(vaar, aar_out)
+    shutil.copy(vpom, pom_out)
+else:
+    raw = os.path.join(repo_dir, "raw.aar")
+    if not (fetch(base + ".pom", pom_out) and fetch(base + ".aar", raw)):
+        sys.exit("JitPack injoignable et aucune copie de secours")
+    with zipfile.ZipFile(raw) as zin, zipfile.ZipFile(aar_out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename.endswith("libgojni.so"):
+                print("retire", item.filename)
+                continue
+            zout.writestr(item, zin.read(item.filename))
+    os.remove(raw)
+    os.makedirs("/tmp/vendor-out", exist_ok=True)
+    shutil.copy(aar_out, "/tmp/vendor-out/")
+    shutil.copy(pom_out, "/tmp/vendor-out/")
 for g in glob.glob("android/build.gradle*"):
     s2 = open(g).read()
     if "localmaven" not in s2:

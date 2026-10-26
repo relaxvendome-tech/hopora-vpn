@@ -46,6 +46,10 @@ jobs:
           git clone -q --depth 1 --branch 2.19.1 --recursive --shallow-submodules \
             https://github.com/heiher/hev-socks5-tunnel.git android/app/src/main/jni/hev-socks5-tunnel
 
+      - name: Copie de secours des dependances (branche vendor)
+        run: |
+          git clone -q --depth 1 --branch vendor "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" vendor || echo "pas de copie de secours"
+
       - name: Configurer Android (VPN, discretion, AdMob, icone)
         run: |
           set -o pipefail
@@ -78,6 +82,15 @@ jobs:
           { grep -nE "rror|What went wrong|FAILURE|xception|\.dart:[0-9]+|Could not|requires|incompatible" build.log | head -60; echo "----- FIN DU JOURNAL -----"; tail -50 build.log; } > err.txt || true
           MSG=$(sed 's/%/%25/g; s/\r//g' err.txt | awk '{printf "%s%%0A", $0}')
           echo "::error title=Build::${MSG}"
+
+      - name: Enregistrer la copie de secours des dependances
+        if: success()
+        run: |
+          [ -d /tmp/vendor-out ] || exit 0
+          cd /tmp/vendor-out && git init -q -b vendor
+          git config user.name "github-actions"; git config user.email "github-actions@users.noreply.github.com"
+          git add . && git commit -q -m "openvpn_library sans libgojni"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" vendor
 
       - name: Deposer l'APK dans la branche hopora-apk
         run: |
