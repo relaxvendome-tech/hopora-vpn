@@ -102,7 +102,22 @@ for g in glob.glob("android/build.gradle*"):
 import json, urllib.request, zipfile
 deps = json.load(open(".flutter-plugins-dependencies"))
 ovpn = [x for x in deps["plugins"]["android"] if x["name"] == "openvpn_flutter"][0]["path"]
-ver = re.search(r"openvpn_library:([^'\"]+)", open(os.path.join(ovpn, "android", "build.gradle")).read()).group(1)
+gtxt = open(os.path.join(ovpn, "android", "build.gradle")).read()
+ver = re.search(r"openvpn_library:([^'\"]+)", gtxt).group(1)
+# Nouvelles versions du plugin : version dans une variable (${openvpnLibraryVersion}).
+m_var = re.match(r"\$\{?(\w+)\}?", ver)
+if m_var:
+    name = m_var.group(1)
+    found = None
+    for src in [gtxt] + [open(f).read() for f in glob.glob(os.path.join(ovpn, "android", "*.properties"))]:
+        mm = re.search(name + r"\s*=\s*['\"]?([\w.\-]+)", src)
+        if mm:
+            found = mm.group(1)
+            break
+    if not found:
+        sys.exit("version de openvpn_library introuvable : " + ver)
+    ver = found
+print("openvpn_library", ver)
 repo_dir = os.path.abspath("android/localmaven/com/github/nizwar/openvpn_library/" + ver)
 os.makedirs(repo_dir, exist_ok=True)
 import time, shutil
