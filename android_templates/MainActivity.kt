@@ -30,6 +30,90 @@ class MainActivity : FlutterActivity() {
             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         }
         if (disguised) setTaskLabel(getString(R.string.calc_name))
+        maybeRunCiTest(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        maybeRunCiTest(intent)
+    }
+
+    // ----- Test automatique d'integration (uniquement en version de test) -----
+    // Active seulement quand l'APK est "debuggable" : la version publiee sur
+    // Google Play ne l'est pas, donc ce code n'y fait jamais rien. La CI lance
+    //   adb shell am start -n <pkg>/.MainActivity -e hopora_ci <methode>
+    // puis lit le journal (adb logcat) pour "HOPORA_CI_RESULT:...".
+    private fun maybeRunCiTest(intent: Intent?) {
+        val debuggable =
+            (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        val method = intent?.getStringExtra("hopora_ci") ?: return
+        if (!debuggable) return
+        android.util.Log.i("HOPORA_CI", "demarrage du test Tor ($method)")
+        Thread { runCiTorTest(method) }.start()
+    }
+
+    private fun ciLog(msg: String) = android.util.Log.i("HOPORA_CI", msg)
+
+    private fun runCiTorTest(method: String) {
+        try {
+            val prep = VpnService.prepare(this)
+            if (prep != null) {
+                // L'autorisation VPN doit etre accordee d'avance par la CI :
+                //   adb shell appops set <pkg> ACTIVATE_VPN allow
+                ciLog("HOPORA_CI_RESULT:$method=ECHEC (autorisation VPN manquante)")
+                return
+            }
+            val svc = Intent(this, TorVpnService::class.java)
+                .setAction(TorVpnService.ACTION_START)
+                .putExtra(TorVpnService.EXTRA_TRANSPORT, method)
+                .putExtra(TorVpnService.EXTRA_NOTIF, "CI")
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
+
+            // Attend que le service ouvre le port SOCKS de Tor (max ~6 min).
+            var socks = 0
+            val startWait = System.currentTimeMillis()
+            while (System.currentTimeMillis() - startWait < 360_000) {
+                socks = TorVpnService.socksPort
+                val st = TorVpnService.state
+                ciLog("etat=$st progression=${TorVpnService.progress} socks=$socks")
+                if (st == "on" && socks > 0) break
+                if (st == "error" || st == "denied") {
+                    ciLog("HOPORA_CI_RESULT:$method=ECHEC (etat=$st ${TorVpnService.error})")
+                    return
+                }
+                Thread.sleep(5000)
+            }
+            if (socks <= 0) {
+                ciLog("HOPORA_CI_RESULT:$method=ECHEC (pas de port SOCKS)")
+                return
+            }
+            // Verification independante, a travers Tor.
+            val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socks))
+            var isTor = false
+            var exitIp = ""
+            for (attempt in 1..6) {
+                try {
+                    val c = URL("https://check.torproject.org/api/ip")
+                        .openConnection(proxy) as HttpURLConnection
+                    c.connectTimeout = 30000
+                    c.readTimeout = 30000
+                    val body = c.inputStream.bufferedReader().use { it.readText() }
+                    isTor = Regex("\"IsTor\"\\s*:\\s*true").containsMatchIn(body)
+                    exitIp = Regex("\"IP\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.get(1) ?: ""
+                    if (isTor) break
+                } catch (e: Exception) {
+                    ciLog("verification essai $attempt : ${e.message}")
+                }
+                Thread.sleep(8000)
+            }
+            if (isTor) {
+                ciLog("HOPORA_CI_RESULT:$method=OK (sortie $exitIp)")
+            } else {
+                ciLog("HOPORA_CI_RESULT:$method=ECHEC (torproject.org ne voit pas Tor)")
+            }
+        } catch (e: Throwable) {
+            ciLog("HOPORA_CI_RESULT:$method=ECHEC (exception ${e.message})")
+        }
     }
 
     @Suppress("DEPRECATION")

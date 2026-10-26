@@ -11,6 +11,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -19,6 +20,15 @@ import 'main.dart';
 import 'tor_page.dart';
 
 const _sec = MethodChannel('hopora/secure');
+
+/// 20 000 tours de SHA-256 (execute dans un isolate via compute()).
+String _slowHash(String input) {
+  List<int> h = utf8.encode(input);
+  for (var i = 0; i < 20000; i++) {
+    h = sha256.convert(h).bytes;
+  }
+  return base64Url.encode(h);
+}
 
 class Ghost {
   static bool get enabled => prefs.getBool('disguise') ?? false;
@@ -49,30 +59,26 @@ class Ghost {
     return salt;
   }
 
-  /// Empreinte lente et salee : le code n'est jamais stocke en clair.
-  static String _hash(String code) {
-    List<int> h = utf8.encode('${_salt()}:$code');
-    for (var i = 0; i < 20000; i++) {
-      h = sha256.convert(h).bytes;
-    }
-    return base64Url.encode(h);
-  }
+  /// Empreinte lente et salee, calculee hors du fil de l'interface
+  /// (isolate) : aucune saccade, meme sur un vieux telephone.
+  static Future<String> _hash(String code) =>
+      compute(_slowHash, '${_salt()}:$code');
 
   static bool validCode(String c) => RegExp(r'^\d{4,8}$').hasMatch(c);
 
   /// 'open', 'duress' ou null.
-  static String? check(String code) {
+  static Future<String?> check(String code) async {
     if (!enabled || !validCode(code)) return null;
-    final h = _hash(code);
+    final h = await _hash(code);
     if (h == prefs.getString('ghost_pin')) return 'open';
     if (h == prefs.getString('ghost_duress')) return 'duress';
     return null;
   }
 
   static Future<void> enable(String pin, String? duress) async {
-    await prefs.setString('ghost_pin', _hash(pin));
+    await prefs.setString('ghost_pin', await _hash(pin));
     if (duress != null && duress.isNotEmpty) {
-      await prefs.setString('ghost_duress', _hash(duress));
+      await prefs.setString('ghost_duress', await _hash(duress));
     } else {
       await prefs.remove('ghost_duress');
     }
@@ -233,23 +239,26 @@ class _CalculatorScreenState extends State<CalculatorScreen> {
 
   void _equals() {
     final raw = _expr;
-    final secret = Ghost.check(raw);
+    // Le resultat s'affiche immediatement ; le code secret est verifie en
+    // arriere-plan (meme apparence qu'un calcul normal).
+    final v = _eval(raw);
+    _result = v == null ? (raw.isEmpty ? '' : 'Error') : _fmt(v);
+    _expr = '';
+    if (Ghost.validCode(raw)) unawaited(_checkSecret(raw));
+  }
+
+  Future<void> _checkSecret(String raw) async {
+    final secret = await Ghost.check(raw);
+    if (!mounted) return;
     if (secret == 'open') {
-      _expr = '';
-      _result = '';
+      setState(() {
+        _expr = '';
+        _result = '';
+      });
       Ghost.locked.value = false;
-      return;
-    }
-    if (secret == 'duress') {
+    } else if (secret == 'duress') {
       unawaited(Ghost.wipe()); // en silence ; l'ecran reste une calculatrice
     }
-    final v = _eval(raw);
-    if (v == null) {
-      _result = raw.isEmpty ? '' : 'Error';
-    } else {
-      _result = _fmt(v);
-    }
-    _expr = '';
   }
 
   /// Evaluation avec priorites (× ÷ avant + −), % = /100.

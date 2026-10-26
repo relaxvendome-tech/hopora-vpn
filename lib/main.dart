@@ -573,7 +573,20 @@ class _ServerListPageState extends State<ServerListPage>
       if (_isConnected || _isBusy) _disconnect();
     };
     _loadHistory();
-    _load();
+    _load().then((_) => _maybeAutoConnect());
+  }
+
+  /// Connexion automatique a l'ouverture (reglage) : attend la fin de la
+  /// mesure des serveurs (8 s maximum) puis se connecte au plus rapide.
+  Future<void> _maybeAutoConnect() async {
+    if (!(prefs.getBool('auto_connect') ?? false)) return;
+    if (!(prefs.getBool('vpn_consent') ?? false)) return;
+    for (var i = 0; i < 16 && _measuring; i++) {
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    final best = _fastest;
+    if (!mounted || best == null || _isConnected || _isBusy) return;
+    _connectTo(best);
   }
 
   void _loadHistory() {
@@ -1283,6 +1296,16 @@ void openAppSettings(BuildContext context, {VoidCallback? onChanged}) {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              SwitchListTile(
+                secondary: const Icon(Icons.flash_on_outlined),
+                title: Text(L.t('auto_connect')),
+                subtitle: Text(L.t('auto_connect_desc')),
+                value: prefs.getBool('auto_connect') ?? false,
+                onChanged: (v) async {
+                  await prefs.setBool('auto_connect', v);
+                  setSheet(() {});
+                },
+              ),
               SwitchListTile(
                 secondary: const Icon(Icons.visibility_off_outlined),
                 title: Text(L.t('discreet_mode')),

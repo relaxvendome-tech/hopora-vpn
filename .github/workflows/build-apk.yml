@@ -59,8 +59,14 @@ jobs:
           UNIT="${ADMOB_INTERSTITIAL_ID:-ca-app-pub-3940256099942544/1033173712}"
           (while true; do echo "$(date +%T) $(free -m | sed -n 2p)" >> mem.log; sleep 20; done) &
           set -o pipefail
-          flutter build apk --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee build.log
-          flutter build appbundle --release --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee -a build.log
+          # Taille : un APK par architecture (au lieu d'un APK universel) et code
+          # Dart obfusque, symboles de debogage sortis du paquet.
+          OPT="--obfuscate --split-debug-info=build/symbols --dart-define=ADMOB_INTERSTITIAL_ID=$UNIT"
+          flutter build apk --release --split-per-abi $OPT 2>&1 | tee build.log
+          flutter build appbundle --release $OPT 2>&1 | tee -a build.log
+          # Version de test (debuggable, x86_64) : seule elle active le test automatique.
+          flutter build apk --debug --target-platform android-x64 --dart-define=ADMOB_INTERSTITIAL_ID="$UNIT" 2>&1 | tee -a build.log
+          ls -la build/app/outputs/flutter-apk/
 
       - name: Remonter les erreurs
         if: failure() || cancelled()
@@ -73,12 +79,17 @@ jobs:
 
       - name: Deposer l'APK dans la branche hopora-apk
         run: |
-          mkdir -p /tmp/out && cp build/app/outputs/flutter-apk/app-release.apk /tmp/out/HoporaVPN.apk
+          mkdir -p /tmp/out
+          D=build/app/outputs/flutter-apk
+          cp $D/app-arm64-v8a-release.apk /tmp/out/HoporaVPN-arm64.apk
+          cp $D/app-armeabi-v7a-release.apk /tmp/out/HoporaVPN-armv7.apk
+          cp $D/app-x86_64-release.apk /tmp/out/HoporaVPN-x86_64.apk
+          cp $D/app-debug.apk /tmp/out/HoporaVPN-ci-debug.apk
           cp build/app/outputs/bundle/release/app-release.aab /tmp/out/HoporaVPN-unsigned.aab
           cd /tmp/out
           ls -la
           # GitHub refuse les fichiers de plus de 100 Mo : decoupage en morceaux.
-          for f in HoporaVPN.apk HoporaVPN-unsigned.aab; do
+          for f in *.apk *.aab; do
             sha256sum "$f" > "$f.sha256"
             split -b 90m -d "$f" "$f.part"
             rm "$f"
@@ -105,8 +116,7 @@ jobs:
       - name: Recuperer l'APK construit (branche hopora-apk)
         run: |
           git clone -q --depth 1 --branch hopora-apk "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" /tmp/apk
-          cat /tmp/apk/HoporaVPN.apk.part* > app-release.apk
-          (cd /tmp/apk && cat HoporaVPN.apk.part* | sha256sum) ; cat /tmp/apk/HoporaVPN.apk.sha256
+          cat /tmp/apk/HoporaVPN-ci-debug.apk.part* > app-ci.apk
           git -C /tmp/apk log -1 --format=%s
 
       - name: Activer la virtualisation (KVM)
@@ -129,7 +139,7 @@ jobs:
           emulator-boot-timeout: 1200
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
-          script: bash ci/e2e.sh app-release.apk e2e-out
+          script: bash ci/e2e.sh app-ci.apk e2e-out
 
       - name: Deposer les resultats dans la branche hopora-e2e
         if: always()

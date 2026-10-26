@@ -191,6 +191,7 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
   IpInfo? _exit;
 
   Timer? _poll;
+  int _ticks = 0;
 
   bool get _on => _state == 'on';
   bool get _busy => _state == 'starting' || _state == 'permission';
@@ -199,7 +200,15 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _refresh();
+    _refresh().then((_) {
+      // Connexion automatique a l'ouverture (reglage), si deja autorisee.
+      if (mounted &&
+          (prefs.getBool('auto_connect') ?? false) &&
+          (prefs.getBool('tor_consent') ?? false) &&
+          _state == 'off') {
+        _connect();
+      }
+    });
     _poll = Timer.periodic(const Duration(seconds: 1), (_) => _refresh());
   }
 
@@ -220,13 +229,25 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
     if (!mounted || m.isEmpty) return;
     final prev = _state;
     final st = (m['state'] ?? 'off') as String;
-    setState(() {
-      _state = st;
-      _progress = (m['progress'] as num?)?.toInt() ?? 0;
-      _transport = (m['transport'] ?? 'direct') as String;
-      _since = (m['since'] as num?)?.toInt() ?? 0;
-      _phaseAt = (m['phaseStartedAt'] as num?)?.toInt() ?? 0;
-    });
+    final progress = (m['progress'] as num?)?.toInt() ?? 0;
+    final transport = (m['transport'] ?? 'direct') as String;
+    final since = (m['since'] as num?)?.toInt() ?? 0;
+    _phaseAt = (m['phaseStartedAt'] as num?)?.toInt() ?? 0;
+    // Reconstruit l'ecran seulement si quelque chose a change (ou une fois
+    // par minute pour la duree de connexion) : interface plus fluide.
+    _ticks++;
+    final changed = st != _state ||
+        progress != _progress ||
+        transport != _transport ||
+        since != _since;
+    if (changed || (st == 'on' && _ticks % 60 == 0)) {
+      setState(() {
+        _state = st;
+        _progress = progress;
+        _transport = transport;
+        _since = since;
+      });
+    }
 
     if (st == 'on' && prev != 'on') {
       _driving = false;
@@ -262,7 +283,12 @@ class _TorPageState extends State<TorPage> with WidgetsBindingObserver {
     var limit = _baseTimeout(_transport);
     if (_progress >= 10) limit += 60; // relais ou pont joint : on patiente
     if (_progress >= 50) limit += 60;
-    if (elapsed < limit) return;
+    // Bascule rapide : en direct ou obfs4, si aucun relais n'est joint apres
+    // quelques secondes, le reseau bloque Tor. Inutile d'attendre davantage.
+    final stalled = _progress < 5 &&
+        ((_transport == 'direct' && elapsed >= 15) ||
+            (_transport == 'obfs4' && elapsed >= 25));
+    if (elapsed < limit && !stalled) return;
 
     if (_planIdx + 1 < _plan.length) {
       _planIdx++;
